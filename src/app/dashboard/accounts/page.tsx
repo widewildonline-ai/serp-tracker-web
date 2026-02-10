@@ -2,10 +2,17 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Account, Keyword, SerpResult } from '@/types/database'
+import { Account, Keyword, Content, SerpResult } from '@/types/database'
 
+// 콘텐츠 + 키워드 + SERP
+type ContentWithKeywordSerp = Content & {
+  keyword?: Pick<Keyword, 'id' | 'keyword' | 'monthly_search_total' | 'opportunity_score'>
+  serp_results: SerpResult[]
+}
+
+// 계정 + 콘텐츠 통계 (V2 구조)
 type AccountWithStats = Account & {
-  keywords: (Keyword & { serp_results: SerpResult[] })[]
+  contents: ContentWithKeywordSerp[]
 }
 
 export default function AccountsPage() {
@@ -19,25 +26,43 @@ export default function AccountsPage() {
   
   const supabase = createClient()
 
-  // 데이터 로드
+  // 데이터 로드 (V2 구조: accounts → contents → keywords, serp_results)
   const loadData = useCallback(async () => {
     setLoading(true)
     
-    const { data, error } = await supabase
+    // 계정 로드
+    const { data: accountsData, error: accountsError } = await supabase
       .from('accounts')
-      .select(`
-        *,
-        keywords(
-          *,
-          serp_results(*)
-        )
-      `)
+      .select('*')
       .order('blog_score', { ascending: false })
     
-    if (error) {
+    // 콘텐츠 + 키워드 + SERP 로드
+    const { data: contentsData } = await supabase
+      .from('contents')
+      .select(`
+        *,
+        keyword:keywords(id, keyword, monthly_search_total, opportunity_score),
+        serp_results(*)
+      `)
+    
+    if (accountsError) {
       setError('데이터 로드 실패')
     } else {
-      setAccounts((data as AccountWithStats[]) || [])
+      // 계정별로 콘텐츠 그룹화
+      const accountsWithContents: AccountWithStats[] = (accountsData || []).map(acc => ({
+        ...acc,
+        contents: (contentsData || [])
+          .filter(c => c.account_id === acc.id)
+          .map(c => ({
+            ...c,
+            serp_results: (c.serp_results || [])
+              .sort((a: SerpResult, b: SerpResult) => 
+                new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
+              )
+          })) as ContentWithKeywordSerp[]
+      }))
+      
+      setAccounts(accountsWithContents)
     }
     
     setLoading(false)
@@ -49,10 +74,10 @@ export default function AccountsPage() {
 
   // 계정 삭제
   const handleDelete = async (account: Account) => {
-    // 키워드 확인
+    // 콘텐츠 확인 (V2: 키워드 대신 콘텐츠)
     const acc = accounts.find(a => a.id === account.id)
-    if (acc && acc.keywords && acc.keywords.length > 0) {
-      setError(`"${account.name}" 계정에 ${acc.keywords.length}개의 키워드가 연결되어 있어 삭제할 수 없습니다.`)
+    if (acc && acc.contents && acc.contents.length > 0) {
+      setError(`"${account.name}" 계정에 ${acc.contents.length}개의 콘텐츠가 연결되어 있어 삭제할 수 없습니다.`)
       return
     }
 
@@ -79,23 +104,23 @@ export default function AccountsPage() {
     }
   }, [error, success])
 
-  // 블로그 지수 자동 계산
-  // 공식: blog_score = (노출키워드비율 × 40) + (평균순위점수 × 30) + (키워드품질 × 30)
+  // 블로그 지수 자동 계산 (V2 구조: contents 기반)
+  // 공식: blog_score = (노출콘텐츠비율 × 40) + (평균순위점수 × 30) + (키워드품질 × 30)
   const calcBlogScore = async () => {
     if (!confirm('모든 계정의 블로그 지수를 SERP 데이터 기반으로 재계산합니다.\n\n계속하시겠습니까?')) return
 
     setCalculating(true)
     try {
       for (const account of accounts) {
-        const keywords = account.keywords || []
-        if (keywords.length === 0) continue
+        const contents = account.contents || []
+        if (contents.length === 0) continue
 
         let exposedCount = 0
         let totalRankScore = 0
         let totalQualityScore = 0
         
-        keywords.forEach(kw => {
-          const latestSerp = (kw.serp_results || [])
+        contents.forEach(content => {
+          const latestSerp = (content.serp_results || [])
             .sort((a, b) => new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime())
           
           const pcSerp = latestSerp.find(s => s.device === 'PC')
@@ -115,13 +140,13 @@ export default function AccountsPage() {
           }
 
           // 키워드 품질 (opportunity_score 활용)
-          totalQualityScore += kw.opportunity_score || 50
+          totalQualityScore += content.keyword?.opportunity_score || 50
         })
 
         // 지표 계산
-        const exposureRate = keywords.length > 0 ? (exposedCount / keywords.length) * 100 : 0
+        const exposureRate = contents.length > 0 ? (exposedCount / contents.length) * 100 : 0
         const avgRankScore = exposedCount > 0 ? totalRankScore / exposedCount : 0
-        const avgQualityScore = keywords.length > 0 ? totalQualityScore / keywords.length : 50
+        const avgQualityScore = contents.length > 0 ? totalQualityScore / contents.length : 50
 
         // 최종 블로그 지수 (0-100)
         const blogScore = Math.round(
@@ -145,17 +170,17 @@ export default function AccountsPage() {
     }
   }
 
-  // 통계 계산
+  // 통계 계산 (V2: contents 기반)
   const getAccountStats = (account: AccountWithStats) => {
-    const keywords = account.keywords || []
-    const totalKeywords = keywords.length
+    const contents = account.contents || []
+    const totalContents = contents.length
     
     let exposedCount = 0
     let totalUp = 0
     let totalDown = 0
 
-    keywords.forEach(kw => {
-      const latestSerp = (kw.serp_results || [])
+    contents.forEach(content => {
+      const latestSerp = (content.serp_results || [])
         .sort((a, b) => new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime())
       
       const pcSerp = latestSerp.find(s => s.device === 'PC')
@@ -167,9 +192,9 @@ export default function AccountsPage() {
     })
 
     return {
-      totalKeywords,
+      totalContents,
       exposedCount,
-      exposureRate: totalKeywords > 0 ? Math.round((exposedCount / totalKeywords) * 100) : 0,
+      exposureRate: totalContents > 0 ? Math.round((exposedCount / totalContents) * 100) : 0,
       totalUp,
       totalDown,
     }
@@ -289,8 +314,8 @@ export default function AccountsPage() {
                   {/* 통계 */}
                   <div className="grid grid-cols-3 gap-2">
                     <div className="bg-slate-700/50 rounded-lg p-3 text-center">
-                      <p className="text-slate-400 text-xs">키워드</p>
-                      <p className="text-white font-bold">{stats.totalKeywords}</p>
+                      <p className="text-slate-400 text-xs">콘텐츠</p>
+                      <p className="text-white font-bold">{stats.totalContents}</p>
                     </div>
                     <div className="bg-slate-700/50 rounded-lg p-3 text-center">
                       <p className="text-slate-400 text-xs">노출률</p>

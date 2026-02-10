@@ -2,21 +2,31 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Account, Keyword, SerpResult } from '@/types/database'
-import { useSearchParams } from 'next/navigation'
+import { Account, Keyword, Content, SerpResult } from '@/types/database'
 
-type KeywordWithAccount = Keyword & { 
-  account: Pick<Account, 'id' | 'name'> | null
+// 콘텐츠 + SERP 결과
+type ContentWithSerp = Content & {
+  account?: Pick<Account, 'id' | 'name'> | null
   serp_results: SerpResult[]
 }
 
+// 키워드 + 콘텐츠 목록
+type KeywordWithContents = Keyword & {
+  contents: ContentWithSerp[]
+}
+
 export default function KeywordsPage() {
-  const [keywords, setKeywords] = useState<KeywordWithAccount[]>([])
+  const [keywords, setKeywords] = useState<KeywordWithContents[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [loading, setLoading] = useState(true)
-  const [showModal, setShowModal] = useState(false)
-  const [editingKeyword, setEditingKeyword] = useState<KeywordWithAccount | null>(null)
-  const [selectedKeywords, setSelectedKeywords] = useState<Set<string>>(new Set())
+  const [expandedKeywords, setExpandedKeywords] = useState<Set<string>>(new Set())
+  
+  // 모달 상태
+  const [showKeywordModal, setShowKeywordModal] = useState(false)
+  const [showContentModal, setShowContentModal] = useState(false)
+  const [selectedKeywordId, setSelectedKeywordId] = useState<string | null>(null)
+  
+  // 알림
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   
@@ -24,29 +34,28 @@ export default function KeywordsPage() {
   const [actionRunning, setActionRunning] = useState<string | null>(null)
   const [actionProgress, setActionProgress] = useState({ current: 0, total: 0, message: '' })
   
-  const searchParams = useSearchParams()
   const supabase = createClient()
-
-  // URL 파라미터로 모달 열기
-  useEffect(() => {
-    const action = searchParams.get('action')
-    if (action === 'new') {
-      setShowModal(true)
-    }
-  }, [searchParams])
 
   // 데이터 로드
   const loadData = useCallback(async () => {
     setLoading(true)
     
+    // 계정 로드
     const { data: accountsData } = await supabase
       .from('accounts')
       .select('*')
       .order('name')
     setAccounts(accountsData || [])
     
-    const { data: keywordsData, error } = await supabase
+    // 키워드 로드
+    const { data: keywordsData } = await supabase
       .from('keywords')
+      .select('*')
+      .order('monthly_search_total', { ascending: false })
+    
+    // 콘텐츠 + SERP 로드
+    const { data: contentsData } = await supabase
+      .from('contents')
       .select(`
         *,
         account:accounts(id, name),
@@ -54,20 +63,22 @@ export default function KeywordsPage() {
       `)
       .order('created_at', { ascending: false })
     
-    if (error) {
-      setError('데이터 로드 실패')
-    } else {
-      const processed = (keywordsData || []).map(kw => ({
-        ...kw,
-        serp_results: (kw.serp_results || [])
-          .sort((a: SerpResult, b: SerpResult) => 
-            new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
-          )
-          .slice(0, 2)
-      }))
-      setKeywords(processed)
-    }
+    // 키워드별로 콘텐츠 그룹화
+    const keywordsWithContents: KeywordWithContents[] = (keywordsData || []).map(kw => ({
+      ...kw,
+      contents: (contentsData || [])
+        .filter(c => c.keyword_id === kw.id)
+        .map(c => ({
+          ...c,
+          serp_results: (c.serp_results || [])
+            .sort((a: SerpResult, b: SerpResult) => 
+              new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
+            )
+            .slice(0, 2) // PC, MO 최신 결과만
+        }))
+    }))
     
+    setKeywords(keywordsWithContents)
     setLoading(false)
   }, [supabase])
 
@@ -75,7 +86,18 @@ export default function KeywordsPage() {
     loadData()
   }, [loadData])
 
-  // EC2 API 설정 가져오기
+  // 알림 자동 숨김
+  useEffect(() => {
+    if (error || success) {
+      const timer = setTimeout(() => {
+        setError(null)
+        setSuccess(null)
+      }, 5000)
+      return () => clearTimeout(timer)
+    }
+  }, [error, success])
+
+  // EC2 API 설정
   const getEC2Config = async () => {
     const { data } = await supabase
       .from('settings')
@@ -85,99 +107,49 @@ export default function KeywordsPage() {
     return data?.value as { base_url: string; secret: string } | undefined
   }
 
-  // 노출잠재력(opportunity_score) 계산 함수
-  const calcOpportunityScore = (volume: number, competition: string, rank: number | null) => {
-    // 검색량 점수 (0-40)
-    const volumeScore = Math.min(40, Math.log10(volume + 10) * 10)
-    
-    // 경쟁도 점수 (0-30)
-    const compMap: Record<string, number> = { '낮음': 30, '중간': 20, '높음': 10, '알 수 없음': 15 }
-    const compScore = compMap[competition] || 15
-    
-    // 순위 점수 (0-30) - 노출 중이면 보너스
-    let rankScore = 15 // 기본
-    if (rank !== null) {
-      if (rank <= 5) rankScore = 30
-      else if (rank <= 10) rankScore = 25
-      else if (rank <= 20) rankScore = 20
+  // 키워드 확장/축소
+  const toggleExpand = (keywordId: string) => {
+    const newExpanded = new Set(expandedKeywords)
+    if (newExpanded.has(keywordId)) {
+      newExpanded.delete(keywordId)
+    } else {
+      newExpanded.add(keywordId)
     }
-    
-    return Math.round(volumeScore + compScore + rankScore)
+    setExpandedKeywords(newExpanded)
   }
 
-  // 난이도(difficulty_score) 계산 함수
-  const calcDifficultyScore = (competition: string, rank: number | null) => {
-    const compMap: Record<string, number> = { '높음': 80, '중간': 50, '낮음': 20, '알 수 없음': 50 }
-    let score = compMap[competition] || 50
-    
-    // 현재 노출 중이면 난이도 낮춤
-    if (rank !== null && rank <= 10) {
-      score = Math.max(10, score - 20)
-    }
-    
-    return score
+  // 콘텐츠의 최신 SERP 결과 가져오기
+  const getLatestSerp = (content: ContentWithSerp, device: 'PC' | 'MO') => {
+    return content.serp_results?.find(r => r.device === device)
   }
 
-  // 지표 계산 (opportunity_score, difficulty_score)
-  const handleCalcScores = async () => {
-    const targetKeywords = selectedKeywords.size > 0 
-      ? keywords.filter(k => selectedKeywords.has(k.id))
-      : keywords
-
-    if (targetKeywords.length === 0) {
-      setError('계산할 키워드가 없습니다')
-      return
+  // 순위 표시 헬퍼
+  const renderRank = (serp: SerpResult | undefined) => {
+    if (!serp || serp.rank === null) {
+      return <span className="text-slate-500">-</span>
     }
-
-    setActionRunning('calc')
-    setActionProgress({ current: 0, total: targetKeywords.length, message: '지표 계산 중...' })
-
-    try {
-      for (let i = 0; i < targetKeywords.length; i++) {
-        const kw = targetKeywords[i]
-        const pcSerp = kw.serp_results?.find(r => r.device === 'PC')
-        const moSerp = kw.serp_results?.find(r => r.device === 'MO')
-        const bestRank = Math.min(pcSerp?.rank ?? 999, moSerp?.rank ?? 999)
-        const rank = bestRank < 999 ? bestRank : null
-
-        const opportunityScore = calcOpportunityScore(kw.monthly_search_total, kw.competition, rank)
-        const difficultyScore = calcDifficultyScore(kw.competition, rank)
-
-        await supabase.from('keywords').update({
-          opportunity_score: opportunityScore,
-          difficulty_score: difficultyScore,
-          updated_at: new Date().toISOString()
-        }).eq('id', kw.id)
-
-        setActionProgress({ 
-          current: i + 1, 
-          total: targetKeywords.length, 
-          message: `지표 계산 중... (${i + 1}/${targetKeywords.length})`
-        })
-      }
-
-      setSuccess(`${targetKeywords.length}개 키워드 지표 계산 완료`)
-      loadData()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '지표 계산 실패')
-    } finally {
-      setActionRunning(null)
-    }
+    const change = serp.rank_change || 0
+    return (
+      <div className="flex items-center gap-1">
+        <span className="text-white font-mono">{serp.rank}</span>
+        {change !== 0 && (
+          <span className={`text-xs ${change > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+            {change > 0 ? `↑${change}` : `↓${Math.abs(change)}`}
+          </span>
+        )}
+      </div>
+    )
   }
 
   // 검색량 업데이트
   const handleVolumeUpdate = async () => {
-    const targetKeywords = selectedKeywords.size > 0 
-      ? keywords.filter(k => selectedKeywords.has(k.id))
-      : keywords
-
-    if (targetKeywords.length === 0) {
+    if (keywords.length === 0) {
       setError('업데이트할 키워드가 없습니다')
       return
     }
 
     setActionRunning('volume')
-    setActionProgress({ current: 0, total: targetKeywords.length, message: '검색량 조회 중...' })
+    setActionProgress({ current: 0, total: keywords.length, message: '검색량 조회 중...' })
 
     try {
       const ec2Config = await getEC2Config()
@@ -185,26 +157,22 @@ export default function KeywordsPage() {
         throw new Error('EC2 API 설정이 없습니다')
       }
 
-      // 배치로 처리 (10개씩)
+      // 배치 처리 (10개씩)
       const batchSize = 10
-      for (let i = 0; i < targetKeywords.length; i += batchSize) {
-        const batch = targetKeywords.slice(i, i + batchSize)
-        const keywordNames = batch.map(k => k.sub_keyword || k.keyword)
+      for (let i = 0; i < keywords.length; i += batchSize) {
+        const batch = keywords.slice(i, i + batchSize)
+        const kwList = batch.map(k => k.sub_keyword || k.keyword)
 
         const response = await fetch(`${ec2Config.base_url}/api/keyword/volume`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            secret: ec2Config.secret,
-            keywords: keywordNames
-          })
+          body: JSON.stringify({ secret: ec2Config.secret, keywords: kwList })
         })
 
         if (!response.ok) throw new Error('API 오류')
 
         const data = await response.json()
 
-        // Supabase 업데이트
         for (const result of data.results) {
           const kw = batch.find(k => (k.sub_keyword || k.keyword) === result.keyword)
           if (kw) {
@@ -222,13 +190,13 @@ export default function KeywordsPage() {
         }
 
         setActionProgress({ 
-          current: Math.min(i + batchSize, targetKeywords.length), 
-          total: targetKeywords.length, 
-          message: `검색량 조회 중... (${Math.min(i + batchSize, targetKeywords.length)}/${targetKeywords.length})`
+          current: Math.min(i + batchSize, keywords.length), 
+          total: keywords.length, 
+          message: `검색량 조회 중... (${Math.min(i + batchSize, keywords.length)}/${keywords.length})`
         })
       }
 
-      setSuccess(`${targetKeywords.length}개 키워드 검색량 업데이트 완료`)
+      setSuccess(`${keywords.length}개 키워드 검색량 업데이트 완료`)
       loadData()
     } catch (err) {
       setError(err instanceof Error ? err.message : '검색량 업데이트 실패')
@@ -237,19 +205,20 @@ export default function KeywordsPage() {
     }
   }
 
-  // SERP 일괄 조회
-  const handleSerpBatch = async (mode: 'all' | 'selected') => {
-    const targetKeywords = mode === 'selected' && selectedKeywords.size > 0
-      ? keywords.filter(k => selectedKeywords.has(k.id))
-      : keywords.filter(k => k.url) // URL이 있는 것만
+  // SERP 조회 (활성 콘텐츠만)
+  const handleSerpBatch = async () => {
+    // 활성 콘텐츠만 필터링
+    const activeContents = keywords.flatMap(kw => 
+      kw.contents.filter(c => c.is_active && c.url)
+    )
 
-    if (targetKeywords.length === 0) {
-      setError('조회할 키워드가 없습니다 (URL이 설정된 키워드만 조회 가능)')
+    if (activeContents.length === 0) {
+      setError('조회할 활성 콘텐츠가 없습니다')
       return
     }
 
     setActionRunning('serp')
-    setActionProgress({ current: 0, total: targetKeywords.length, message: 'SERP 조회 중...' })
+    setActionProgress({ current: 0, total: activeContents.length, message: 'SERP 조회 중...' })
 
     try {
       const ec2Config = await getEC2Config()
@@ -259,26 +228,19 @@ export default function KeywordsPage() {
 
       const today = new Date().toISOString().split('T')[0]
 
-      // 이전 순위 저장 (변동 계산용)
-      const prevRanks: Record<string, { pc: number | null; mo: number | null }> = {}
-      for (const kw of targetKeywords) {
-        const pcResult = kw.serp_results?.find(r => r.device === 'PC')
-        const moResult = kw.serp_results?.find(r => r.device === 'MO')
-        prevRanks[kw.id] = {
-          pc: pcResult?.rank ?? null,
-          mo: moResult?.rank ?? null
-        }
-      }
-
-      // 순차 처리 (1개씩)
-      for (let i = 0; i < targetKeywords.length; i++) {
-        const kw = targetKeywords[i]
+      for (let i = 0; i < activeContents.length; i++) {
+        const content = activeContents[i]
+        const keyword = keywords.find(k => k.id === content.keyword_id)
         
         setActionProgress({ 
           current: i + 1, 
-          total: targetKeywords.length, 
-          message: `SERP 조회: ${kw.keyword} (${i + 1}/${targetKeywords.length})`
+          total: activeContents.length, 
+          message: `SERP 조회: ${keyword?.keyword || ''} (${i + 1}/${activeContents.length})`
         })
+
+        // 이전 순위 저장
+        const prevPc = getLatestSerp(content, 'PC')?.rank ?? null
+        const prevMo = getLatestSerp(content, 'MO')?.rank ?? null
 
         try {
           const response = await fetch(`${ec2Config.base_url}/api/serp/check`, {
@@ -286,8 +248,8 @@ export default function KeywordsPage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               secret: ec2Config.secret,
-              keyword: kw.sub_keyword || kw.keyword,
-              url: kw.url,
+              keyword: keyword?.sub_keyword || keyword?.keyword,
+              url: content.url,
               rank_max: 20
             })
           })
@@ -295,47 +257,52 @@ export default function KeywordsPage() {
           if (!response.ok) continue
 
           const result = await response.json()
-          const prev = prevRanks[kw.id]
 
           // 변동 계산
-          const calcChange = (prevRank: number | null, currRank: number | null) => {
-            if (prevRank === null || currRank === null) return 0
-            return prevRank - currRank // 양수면 상승, 음수면 하락
+          const calcChange = (prev: number | null, curr: number | null) => {
+            if (prev === null || curr === null) return 0
+            return prev - curr
           }
 
           // PC 결과 저장
           await supabase.from('serp_results').upsert({
-            keyword_id: kw.id,
+            content_id: content.id,
             device: 'PC',
             rank: result.pc_rank,
-            rank_change: calcChange(prev.pc, result.pc_rank),
-            url: kw.url,
+            rank_change: calcChange(prevPc, result.pc_rank),
             is_exposed: result.pc_rank !== null,
             captured_at: today,
-          }, { onConflict: 'keyword_id,device,captured_at' })
+          }, { onConflict: 'content_id,device,captured_at' })
 
           // MO 결과 저장
           await supabase.from('serp_results').upsert({
-            keyword_id: kw.id,
+            content_id: content.id,
             device: 'MO',
             rank: result.mo_rank,
-            rank_change: calcChange(prev.mo, result.mo_rank),
-            url: kw.url,
+            rank_change: calcChange(prevMo, result.mo_rank),
             is_exposed: result.mo_rank !== null,
             captured_at: today,
-          }, { onConflict: 'keyword_id,device,captured_at' })
+          }, { onConflict: 'content_id,device,captured_at' })
+
+          // 미노출이면 is_active = false 처리
+          if (result.pc_rank === null && result.mo_rank === null) {
+            await supabase.from('contents').update({
+              is_active: false,
+              updated_at: new Date().toISOString()
+            }).eq('id', content.id)
+          }
 
         } catch {
-          console.error(`SERP 조회 실패: ${kw.keyword}`)
+          console.error(`SERP 조회 실패: ${content.url}`)
         }
 
         // 딜레이
-        if (i < targetKeywords.length - 1) {
+        if (i < activeContents.length - 1) {
           await new Promise(r => setTimeout(r, 2000))
         }
       }
 
-      setSuccess(`${targetKeywords.length}개 키워드 SERP 조회 완료`)
+      setSuccess(`${activeContents.length}개 콘텐츠 SERP 조회 완료`)
       loadData()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'SERP 조회 실패')
@@ -344,64 +311,187 @@ export default function KeywordsPage() {
     }
   }
 
+  // 발행기록에서 동기화
+  const handleSyncFromPublishRecords = async () => {
+    if (!confirm('발행 기록(publish_records)에서 키워드와 콘텐츠를 가져옵니다.\n\n계속하시겠습니까?')) return
+
+    setActionRunning('sync')
+    setActionProgress({ current: 0, total: 0, message: '발행 기록 조회 중...' })
+
+    try {
+      // 발행 기록 조회
+      const { data: publishRecords, error: prError } = await supabase
+        .from('publish_records')
+        .select('*')
+
+      if (prError) throw prError
+      if (!publishRecords || publishRecords.length === 0) {
+        setError('발행 기록이 없습니다')
+        return
+      }
+
+      setActionProgress({ current: 0, total: publishRecords.length, message: `${publishRecords.length}개 발행 기록 동기화 중...` })
+
+      // 계정 이름 -> ID 매핑
+      const accountMap = new Map(accounts.map(a => [a.name.toLowerCase(), a.id]))
+
+      let keywordCount = 0
+      let contentCount = 0
+
+      for (let i = 0; i < publishRecords.length; i++) {
+        const pr = publishRecords[i]
+        if (!pr.main_keyword) continue
+
+        // 1. 키워드 추가/조회
+        let keywordId: string
+
+        const { data: existingKw } = await supabase
+          .from('keywords')
+          .select('id')
+          .eq('keyword', pr.main_keyword)
+          .single()
+
+        if (existingKw) {
+          keywordId = existingKw.id
+        } else {
+          // 새 키워드 추가
+          const { data: newKw, error: kwError } = await supabase
+            .from('keywords')
+            .insert({
+              keyword: pr.main_keyword,
+              sub_keyword: pr.sub_keyword,
+              monthly_search_pc: pr.search_pc || 0,
+              monthly_search_mo: pr.search_mo || 0,
+              monthly_search_total: pr.search_total || 0,
+              competition: pr.competition || '알 수 없음',
+              mobile_ratio: pr.mobile_ratio || 0,
+              opportunity_score: pr.opportunity_score || 0,
+            })
+            .select('id')
+            .single()
+
+          if (kwError || !newKw) continue
+          keywordId = newKw.id
+          keywordCount++
+        }
+
+        // 2. 콘텐츠 추가 (URL이 있는 경우만)
+        if (pr.url) {
+          const accountId = pr.account_name ? accountMap.get(pr.account_name.toLowerCase()) : null
+
+          // 중복 체크
+          const { data: existingContent } = await supabase
+            .from('contents')
+            .select('id')
+            .eq('keyword_id', keywordId)
+            .eq('url', pr.url)
+            .single()
+
+          if (!existingContent) {
+            const isExposed = pr.rank_pc !== null || pr.rank_mo !== null
+
+            await supabase.from('contents').insert({
+              keyword_id: keywordId,
+              account_id: accountId || null,
+              url: pr.url,
+              title: pr.title,
+              published_date: pr.published_date,
+              is_active: isExposed, // 노출 중이면 활성
+              camfit_link: pr.camfit_link || false,
+              source_file: pr.source_file,
+            })
+            contentCount++
+          }
+        }
+
+        setActionProgress({ 
+          current: i + 1, 
+          total: publishRecords.length, 
+          message: `동기화 중... (${i + 1}/${publishRecords.length})`
+        })
+      }
+
+      setSuccess(`동기화 완료: 키워드 ${keywordCount}개, 콘텐츠 ${contentCount}개 추가`)
+      loadData()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '동기화 실패')
+    } finally {
+      setActionRunning(null)
+    }
+  }
+
   // 키워드 삭제
-  const handleDelete = async (keyword: KeywordWithAccount) => {
-    if (!confirm(`"${keyword.keyword}" 키워드를 삭제하시겠습니까?`)) return
+  const handleDeleteKeyword = async (keyword: KeywordWithContents) => {
+    if (keyword.contents.length > 0) {
+      if (!confirm(`"${keyword.keyword}" 키워드에 ${keyword.contents.length}개의 콘텐츠가 있습니다.\n키워드와 모든 콘텐츠가 삭제됩니다.\n\n계속하시겠습니까?`)) return
+    } else {
+      if (!confirm(`"${keyword.keyword}" 키워드를 삭제하시겠습니까?`)) return
+    }
 
     const { error } = await supabase.from('keywords').delete().eq('id', keyword.id)
-
     if (error) {
-      setError('삭제 실패: ' + error.message)
+      setError('삭제 실패')
     } else {
-      setSuccess('키워드가 삭제되었습니다.')
+      setSuccess('키워드가 삭제되었습니다')
       loadData()
     }
   }
 
-  // 선택 토글
-  const toggleSelect = (id: string) => {
-    const newSet = new Set(selectedKeywords)
-    if (newSet.has(id)) newSet.delete(id)
-    else newSet.add(id)
-    setSelectedKeywords(newSet)
-  }
+  // 콘텐츠 삭제
+  const handleDeleteContent = async (content: ContentWithSerp) => {
+    if (!confirm('이 콘텐츠를 삭제하시겠습니까?')) return
 
-  const toggleSelectAll = () => {
-    if (selectedKeywords.size === keywords.length) {
-      setSelectedKeywords(new Set())
+    const { error } = await supabase.from('contents').delete().eq('id', content.id)
+    if (error) {
+      setError('삭제 실패')
     } else {
-      setSelectedKeywords(new Set(keywords.map(k => k.id)))
+      setSuccess('콘텐츠가 삭제되었습니다')
+      loadData()
     }
   }
 
-  // 알림 자동 숨김
-  useEffect(() => {
-    if (error || success) {
-      const timer = setTimeout(() => {
-        setError(null)
-        setSuccess(null)
-      }, 5000)
-      return () => clearTimeout(timer)
-    }
-  }, [error, success])
+  // 콘텐츠 활성화/비활성화 토글
+  const toggleContentActive = async (content: ContentWithSerp) => {
+    const newActive = !content.is_active
+    await supabase.from('contents').update({
+      is_active: newActive,
+      updated_at: new Date().toISOString()
+    }).eq('id', content.id)
+    loadData()
+  }
 
-  // SERP 결과 가져오기
-  const getLatestSerp = (keyword: KeywordWithAccount, device: 'PC' | 'MO') => {
-    const result = keyword.serp_results?.find(r => r.device === device)
-    return { rank: result?.rank ?? null, change: result?.rank_change ?? 0 }
+  // 통계
+  const stats = {
+    totalKeywords: keywords.length,
+    totalContents: keywords.reduce((sum, k) => sum + k.contents.length, 0),
+    activeContents: keywords.reduce((sum, k) => sum + k.contents.filter(c => c.is_active).length, 0),
+    exposedContents: keywords.reduce((sum, k) => 
+      sum + k.contents.filter(c => {
+        const pc = getLatestSerp(c, 'PC')
+        const mo = getLatestSerp(c, 'MO')
+        return (pc?.rank !== null && pc?.rank !== undefined) || (mo?.rank !== null && mo?.rank !== undefined)
+      }).length, 0
+    ),
   }
 
   return (
     <div className="space-y-6">
       {/* 헤더 */}
-      <div className="flex items-center justify-between flex-wrap gap-4">
+      <div className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-bold text-white">키워드 관리</h1>
           <p className="text-slate-400 mt-1">
-            {keywords.length}개 키워드 · {selectedKeywords.size}개 선택됨
+            {stats.totalKeywords}개 키워드 · {stats.totalContents}개 콘텐츠 · {stats.activeContents}개 추적 중
           </p>
         </div>
         <div className="flex gap-2 flex-wrap">
+          <button
+            onClick={handleSyncFromPublishRecords}
+            disabled={actionRunning !== null}
+            className="px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition disabled:opacity-50 flex items-center gap-2"
+          >
+            📥 발행기록 동기화
+          </button>
           <button
             onClick={handleVolumeUpdate}
             disabled={actionRunning !== null}
@@ -410,32 +500,25 @@ export default function KeywordsPage() {
             📊 검색량
           </button>
           <button
-            onClick={() => handleSerpBatch('all')}
+            onClick={handleSerpBatch}
             disabled={actionRunning !== null}
             className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition disabled:opacity-50 flex items-center gap-2"
           >
             🔍 SERP
           </button>
           <button
-            onClick={handleCalcScores}
+            onClick={() => setShowKeywordModal(true)}
             disabled={actionRunning !== null}
-            className="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition disabled:opacity-50 flex items-center gap-2"
-          >
-            📈 지표계산
-          </button>
-          <button
-            onClick={() => handleSerpBatch('selected')}
-            disabled={actionRunning !== null || selectedKeywords.size === 0}
             className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition disabled:opacity-50 flex items-center gap-2"
           >
-            선택({selectedKeywords.size})
+            ➕ 키워드
           </button>
           <button
-            onClick={() => setShowModal(true)}
+            onClick={() => { setSelectedKeywordId(null); setShowContentModal(true) }}
             disabled={actionRunning !== null}
             className="px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition disabled:opacity-50 flex items-center gap-2"
           >
-            ➕ 추가
+            📝 콘텐츠
           </button>
         </div>
       </div>
@@ -450,7 +533,7 @@ export default function KeywordsPage() {
           <div className="w-full bg-slate-700 rounded-full h-2">
             <div 
               className="bg-purple-500 h-2 rounded-full transition-all"
-              style={{ width: `${(actionProgress.current / actionProgress.total) * 100}%` }}
+              style={{ width: `${actionProgress.total > 0 ? (actionProgress.current / actionProgress.total) * 100 : 0}%` }}
             />
           </div>
         </div>
@@ -469,379 +552,497 @@ export default function KeywordsPage() {
       )}
 
       {/* 키워드 목록 */}
-      <div className="bg-slate-800/50 rounded-xl border border-slate-700 overflow-hidden">
+      <div className="space-y-3">
         {loading ? (
-          <div className="p-8 text-center text-slate-400">
+          <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-8 text-center text-slate-400">
             <div className="animate-spin w-8 h-8 border-2 border-purple-500 border-t-transparent rounded-full mx-auto mb-4" />
             로딩 중...
           </div>
         ) : keywords.length === 0 ? (
-          <div className="p-8 text-center text-slate-400">등록된 키워드가 없습니다</div>
+          <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-8 text-center text-slate-400">
+            <p className="text-4xl mb-4">📭</p>
+            <p>등록된 키워드가 없습니다</p>
+            <p className="text-sm mt-2">"발행기록 동기화" 또는 "키워드 추가"로 시작하세요</p>
+          </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="bg-slate-700/50">
-                <tr>
-                  <th className="px-3 py-4 text-left">
-                    <input
-                      type="checkbox"
-                      checked={selectedKeywords.size === keywords.length && keywords.length > 0}
-                      onChange={toggleSelectAll}
-                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-500"
-                    />
-                  </th>
-                  <th className="px-3 py-4 text-left text-xs font-medium text-slate-400 uppercase">키워드</th>
-                  <th className="px-3 py-4 text-left text-xs font-medium text-slate-400 uppercase">계정</th>
-                  <th className="px-3 py-4 text-right text-xs font-medium text-slate-400 uppercase">검색량</th>
-                  <th className="px-3 py-4 text-center text-xs font-medium text-slate-400 uppercase">경쟁</th>
-                  <th className="px-3 py-4 text-center text-xs font-medium text-slate-400 uppercase">MO%</th>
-                  <th className="px-3 py-4 text-center text-xs font-medium text-slate-400 uppercase">PC순위</th>
-                  <th className="px-3 py-4 text-center text-xs font-medium text-slate-400 uppercase">MO순위</th>
-                  <th className="px-3 py-4 text-right text-xs font-medium text-slate-400 uppercase">작업</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-700/50">
-                {keywords.map((keyword) => {
-                  const pcSerp = getLatestSerp(keyword, 'PC')
-                  const moSerp = getLatestSerp(keyword, 'MO')
-                  
-                  return (
-                    <tr key={keyword.id} className="hover:bg-slate-700/30">
-                      <td className="px-3 py-4">
-                        <input
-                          type="checkbox"
-                          checked={selectedKeywords.has(keyword.id)}
-                          onChange={() => toggleSelect(keyword.id)}
-                          className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-500"
-                        />
-                      </td>
-                      <td className="px-3 py-4">
-                        <div>
-                          <p className="text-white font-medium">{keyword.keyword}</p>
-                          {keyword.sub_keyword && (
-                            <p className="text-slate-500 text-xs">{keyword.sub_keyword}</p>
-                          )}
-                          {keyword.url && (
-                            <a href={keyword.url} target="_blank" rel="noopener noreferrer" 
-                               className="text-purple-400 text-xs hover:underline truncate block max-w-[200px]">
-                              {keyword.url}
-                            </a>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-3 py-4">
-                        <span className="text-xs bg-slate-700 text-slate-300 px-2 py-1 rounded">
-                          {keyword.account?.name || '미지정'}
+          keywords.map(keyword => {
+            const isExpanded = expandedKeywords.has(keyword.id)
+            const activeCount = keyword.contents.filter(c => c.is_active).length
+            const exposedCount = keyword.contents.filter(c => {
+              const pc = getLatestSerp(c, 'PC')
+              const mo = getLatestSerp(c, 'MO')
+              return pc?.is_exposed || mo?.is_exposed
+            }).length
+
+            return (
+              <div key={keyword.id} className="bg-slate-800/50 rounded-xl border border-slate-700 overflow-hidden">
+                {/* 키워드 헤더 */}
+                <div 
+                  className="flex items-center justify-between p-4 cursor-pointer hover:bg-slate-700/30 transition"
+                  onClick={() => toggleExpand(keyword.id)}
+                >
+                  <div className="flex items-center gap-4">
+                    <span className="text-slate-400 text-lg">
+                      {isExpanded ? '▼' : '▶'}
+                    </span>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-white font-semibold text-lg">{keyword.keyword}</span>
+                        {keyword.sub_keyword && (
+                          <span className="text-slate-500 text-sm">({keyword.sub_keyword})</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-4 mt-1 text-sm">
+                        <span className="text-slate-400">
+                          검색량: <span className="text-white font-mono">{keyword.monthly_search_total.toLocaleString()}</span>
                         </span>
-                      </td>
-                      <td className="px-3 py-4 text-right">
-                        <div className="text-sm">
-                          <span className="text-white font-mono">{keyword.monthly_search_total?.toLocaleString() || '-'}</span>
-                          <div className="text-slate-500 text-xs">
-                            PC:{keyword.monthly_search_pc?.toLocaleString() || 0} / MO:{keyword.monthly_search_mo?.toLocaleString() || 0}
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-3 py-4 text-center">
-                        <span className={`px-2 py-1 text-xs rounded ${
+                        <span className={`px-2 py-0.5 text-xs rounded ${
                           keyword.competition === '높음' ? 'bg-red-500/20 text-red-400' :
                           keyword.competition === '중간' ? 'bg-yellow-500/20 text-yellow-400' :
                           keyword.competition === '낮음' ? 'bg-emerald-500/20 text-emerald-400' :
                           'bg-slate-500/20 text-slate-400'
                         }`}>
-                          {keyword.competition || '-'}
+                          {keyword.competition}
                         </span>
-                      </td>
-                      <td className="px-3 py-4 text-center">
-                        <span className="text-slate-300 text-sm">
-                          {keyword.mobile_ratio ? `${keyword.mobile_ratio}%` : '-'}
+                        <span className="text-slate-500">
+                          콘텐츠 {keyword.contents.length}개
                         </span>
-                      </td>
-                      <td className="px-3 py-4 text-center">
-                        <RankCell rank={pcSerp.rank} change={pcSerp.change} />
-                      </td>
-                      <td className="px-3 py-4 text-center">
-                        <RankCell rank={moSerp.rank} change={moSerp.change} />
-                      </td>
-                      <td className="px-3 py-4 text-right">
-                        <button
-                          onClick={() => { setEditingKeyword(keyword); setShowModal(true) }}
-                          className="text-slate-400 hover:text-purple-400 px-2 py-1 text-sm"
-                        >
-                          수정
-                        </button>
-                        <button
-                          onClick={() => handleDelete(keyword)}
-                          className="text-slate-400 hover:text-red-400 px-2 py-1 text-sm"
-                        >
-                          삭제
-                        </button>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
+                        {activeCount > 0 && (
+                          <span className="text-emerald-400">
+                            추적 {activeCount}개
+                          </span>
+                        )}
+                        {exposedCount > 0 && (
+                          <span className="text-purple-400">
+                            노출 {exposedCount}개
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
+                    <button
+                      onClick={() => { setSelectedKeywordId(keyword.id); setShowContentModal(true) }}
+                      className="px-3 py-1 text-sm bg-emerald-600/20 text-emerald-400 rounded hover:bg-emerald-600/30 transition"
+                    >
+                      + 콘텐츠
+                    </button>
+                    <button
+                      onClick={() => handleDeleteKeyword(keyword)}
+                      className="px-3 py-1 text-sm bg-red-600/20 text-red-400 rounded hover:bg-red-600/30 transition"
+                    >
+                      삭제
+                    </button>
+                  </div>
+                </div>
+
+                {/* 콘텐츠 목록 (펼쳤을 때) */}
+                {isExpanded && (
+                  <div className="border-t border-slate-700">
+                    {keyword.contents.length === 0 ? (
+                      <div className="p-4 text-center text-slate-500 text-sm">
+                        등록된 콘텐츠가 없습니다
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-slate-700/50">
+                        {keyword.contents.map(content => {
+                          const pcSerp = getLatestSerp(content, 'PC')
+                          const moSerp = getLatestSerp(content, 'MO')
+                          
+                          return (
+                            <div 
+                              key={content.id} 
+                              className={`p-4 pl-12 flex items-center justify-between ${
+                                !content.is_active ? 'opacity-50' : ''
+                              }`}
+                            >
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${
+                                    content.is_active ? 'bg-emerald-500' : 'bg-slate-500'
+                                  }`} />
+                                  {content.title ? (
+                                    <a 
+                                      href={content.url} 
+                                      target="_blank" 
+                                      rel="noopener noreferrer"
+                                      className="text-white hover:text-purple-400 truncate"
+                                    >
+                                      📄 {content.title}
+                                    </a>
+                                  ) : (
+                                    <a 
+                                      href={content.url} 
+                                      target="_blank" 
+                                      rel="noopener noreferrer"
+                                      className="text-purple-400 hover:underline text-sm truncate"
+                                    >
+                                      {content.url}
+                                    </a>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-4 mt-1 text-sm text-slate-500">
+                                  {content.account && (
+                                    <span className="bg-slate-700 px-2 py-0.5 rounded text-xs">
+                                      {content.account.name}
+                                    </span>
+                                  )}
+                                  {content.published_date && (
+                                    <span>{content.published_date}</span>
+                                  )}
+                                  {!content.is_active && (
+                                    <span className="text-red-400 text-xs">추적 중지</span>
+                                  )}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-6">
+                                <div className="text-center">
+                                  <p className="text-slate-500 text-xs mb-1">PC</p>
+                                  {renderRank(pcSerp)}
+                                </div>
+                                <div className="text-center">
+                                  <p className="text-slate-500 text-xs mb-1">MO</p>
+                                  {renderRank(moSerp)}
+                                </div>
+                                <div className="flex gap-2">
+                                  <button
+                                    onClick={() => toggleContentActive(content)}
+                                    className={`px-2 py-1 text-xs rounded ${
+                                      content.is_active 
+                                        ? 'bg-slate-600/50 text-slate-400 hover:bg-slate-600'
+                                        : 'bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/30'
+                                    }`}
+                                  >
+                                    {content.is_active ? '중지' : '활성화'}
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteContent(content)}
+                                    className="px-2 py-1 text-xs bg-red-600/20 text-red-400 rounded hover:bg-red-600/30"
+                                  >
+                                    삭제
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })
         )}
       </div>
 
-      {/* 키워드 모달 */}
-      {showModal && (
+      {/* 키워드 추가 모달 */}
+      {showKeywordModal && (
         <KeywordModal
-          keyword={editingKeyword}
+          supabase={supabase}
+          existingKeywords={keywords.map(k => k.keyword.toLowerCase())}
+          onClose={() => setShowKeywordModal(false)}
+          onSuccess={(msg) => { setSuccess(msg); loadData() }}
+          onError={setError}
+        />
+      )}
+
+      {/* 콘텐츠 추가 모달 */}
+      {showContentModal && (
+        <ContentModal
+          supabase={supabase}
+          keywords={keywords}
           accounts={accounts}
-          onClose={() => { setShowModal(false); setEditingKeyword(null) }}
-          onSaved={() => {
-            setSuccess(editingKeyword ? '키워드가 수정되었습니다.' : '키워드가 추가되었습니다.')
-            setShowModal(false)
-            setEditingKeyword(null)
-            loadData()
-          }}
+          preselectedKeywordId={selectedKeywordId}
+          onClose={() => { setShowContentModal(false); setSelectedKeywordId(null) }}
+          onSuccess={(msg) => { setSuccess(msg); loadData() }}
+          onError={setError}
         />
       )}
     </div>
   )
 }
 
-// 순위 셀
-function RankCell({ rank, change }: { rank: number | null; change: number }) {
-  if (rank === null) {
-    return <span className="text-slate-500 text-sm">-</span>
-  }
-  
-  return (
-    <div className="flex items-center justify-center gap-1">
-      <span className="text-white font-mono text-sm">{rank}</span>
-      {change !== 0 && (
-        <span className={`text-xs ${change > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-          {change > 0 ? `↑${change}` : `↓${Math.abs(change)}`}
-        </span>
-      )}
-    </div>
-  )
-}
-
-// 키워드 모달
+// 키워드 추가 모달
 function KeywordModal({
-  keyword,
-  accounts,
+  supabase,
+  existingKeywords,
   onClose,
-  onSaved,
+  onSuccess,
+  onError,
 }: {
-  keyword: KeywordWithAccount | null
-  accounts: Account[]
+  supabase: ReturnType<typeof createClient>
+  existingKeywords: string[]
   onClose: () => void
-  onSaved: () => void
+  onSuccess: (msg: string) => void
+  onError: (msg: string) => void
 }) {
-  const [formData, setFormData] = useState({
-    account_id: keyword?.account_id || '',
-    keyword: keyword?.keyword || '',
-    sub_keyword: keyword?.sub_keyword || '',
-    url: keyword?.url || '',
-    monthly_search_pc: keyword?.monthly_search_pc || 0,
-    monthly_search_mo: keyword?.monthly_search_mo || 0,
-    competition: keyword?.competition || '알 수 없음',
-  })
+  const [keyword, setKeyword] = useState('')
+  const [subKeyword, setSubKeyword] = useState('')
   const [saving, setSaving] = useState(false)
-  const [analyzing, setAnalyzing] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  
-  const supabase = createClient()
 
-  // URL 자동 분석
-  const handleAnalyzeUrl = async () => {
-    if (!formData.url) return
-    
-    setAnalyzing(true)
-    setError(null)
-    
-    try {
-      const { data: settingsData } = await supabase
-        .from('settings')
-        .select('value')
-        .eq('key', 'ec2_api')
-        .single()
-      
-      const ec2Config = settingsData?.value as { base_url: string; secret: string }
-      
-      const response = await fetch(`${ec2Config.base_url}/api/blog/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          secret: ec2Config.secret,
-          url: formData.url
-        })
-      })
-      
-      if (!response.ok) throw new Error('분석 실패')
-      
-      const result = await response.json()
-      
-      setFormData(prev => ({
-        ...prev,
-        keyword: result.main_keyword || prev.keyword,
-        sub_keyword: result.sub_keyword || prev.sub_keyword,
-      }))
-    } catch (err) {
-      setError('URL 분석 실패')
-    } finally {
-      setAnalyzing(false)
+  const handleSave = async () => {
+    if (!keyword.trim()) {
+      onError('키워드를 입력하세요')
+      return
     }
-  }
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
+    if (existingKeywords.includes(keyword.trim().toLowerCase())) {
+      onError('이미 존재하는 키워드입니다')
+      return
+    }
+
     setSaving(true)
-    setError(null)
+    const { error } = await supabase.from('keywords').insert({
+      keyword: keyword.trim(),
+      sub_keyword: subKeyword.trim() || null,
+    })
 
-    const payload = {
-      account_id: formData.account_id || null,
-      keyword: formData.keyword,
-      sub_keyword: formData.sub_keyword || null,
-      url: formData.url || null,
-      monthly_search_pc: formData.monthly_search_pc,
-      monthly_search_mo: formData.monthly_search_mo,
-      monthly_search_total: formData.monthly_search_pc + formData.monthly_search_mo,
-      competition: formData.competition,
-      updated_at: new Date().toISOString(),
-    }
-
-    if (keyword) {
-      const { error } = await supabase.from('keywords').update(payload).eq('id', keyword.id)
-      if (error) { setError('수정 실패: ' + error.message); setSaving(false); return }
+    if (error) {
+      onError('키워드 추가 실패')
     } else {
-      const { error } = await supabase.from('keywords').insert(payload)
-      if (error) { setError('추가 실패: ' + error.message); setSaving(false); return }
+      onSuccess('키워드가 추가되었습니다')
+      onClose()
     }
-
-    onSaved()
+    setSaving(false)
   }
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-slate-800 rounded-xl border border-slate-700 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
-        <div className="px-6 py-4 border-b border-slate-700 flex items-center justify-between sticky top-0 bg-slate-800">
-          <h2 className="text-lg font-semibold text-white">
-            {keyword ? '키워드 수정' : '키워드 추가'}
-          </h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-white">✕</button>
+      <div className="bg-slate-800 rounded-xl border border-slate-700 w-full max-w-md p-6">
+        <h2 className="text-xl font-bold text-white mb-4">키워드 추가</h2>
+        
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">메인 키워드 *</label>
+            <input
+              type="text"
+              value={keyword}
+              onChange={e => setKeyword(e.target.value)}
+              placeholder="예: 캠핑장"
+              className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">서브 키워드</label>
+            <input
+              type="text"
+              value={subKeyword}
+              onChange={e => setSubKeyword(e.target.value)}
+              placeholder="예: 가평 캠핑장"
+              className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
+            />
+          </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
-          {error && (
-            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-red-400 text-sm">
-              {error}
-            </div>
-          )}
+        <div className="flex justify-end gap-2 mt-6">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600"
+          >
+            취소
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50"
+          >
+            {saving ? '저장 중...' : '추가'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
+// 콘텐츠 추가 모달
+function ContentModal({
+  supabase,
+  keywords,
+  accounts,
+  preselectedKeywordId,
+  onClose,
+  onSuccess,
+  onError,
+}: {
+  supabase: ReturnType<typeof createClient>
+  keywords: KeywordWithContents[]
+  accounts: Account[]
+  preselectedKeywordId: string | null
+  onClose: () => void
+  onSuccess: (msg: string) => void
+  onError: (msg: string) => void
+}) {
+  const [keywordInput, setKeywordInput] = useState('')
+  const [selectedKeywordId, setSelectedKeywordId] = useState(preselectedKeywordId || '')
+  const [url, setUrl] = useState('')
+  const [title, setTitle] = useState('')
+  const [accountId, setAccountId] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  // 키워드 검색 결과
+  const filteredKeywords = keywordInput
+    ? keywords.filter(k => 
+        k.keyword.toLowerCase().includes(keywordInput.toLowerCase()) ||
+        k.sub_keyword?.toLowerCase().includes(keywordInput.toLowerCase())
+      )
+    : keywords
+
+  const handleSave = async () => {
+    if (!url.trim()) {
+      onError('URL을 입력하세요')
+      return
+    }
+
+    let finalKeywordId = selectedKeywordId
+
+    // 키워드가 선택되지 않았고 입력값이 있으면 새 키워드 생성
+    if (!finalKeywordId && keywordInput.trim()) {
+      const existing = keywords.find(k => k.keyword.toLowerCase() === keywordInput.trim().toLowerCase())
+      
+      if (existing) {
+        finalKeywordId = existing.id
+      } else {
+        // 새 키워드 생성
+        const { data: newKw, error: kwError } = await supabase
+          .from('keywords')
+          .insert({ keyword: keywordInput.trim() })
+          .select('id')
+          .single()
+
+        if (kwError || !newKw) {
+          onError('키워드 생성 실패')
+          return
+        }
+        finalKeywordId = newKw.id
+      }
+    }
+
+    if (!finalKeywordId) {
+      onError('키워드를 선택하거나 입력하세요')
+      return
+    }
+
+    setSaving(true)
+    
+    const { error } = await supabase.from('contents').insert({
+      keyword_id: finalKeywordId,
+      account_id: accountId || null,
+      url: url.trim(),
+      title: title.trim() || null,
+      is_active: true,
+    })
+
+    if (error) {
+      if (error.code === '23505') {
+        onError('이미 등록된 콘텐츠입니다 (같은 키워드에 같은 URL)')
+      } else {
+        onError('콘텐츠 추가 실패')
+      }
+    } else {
+      onSuccess('콘텐츠가 추가되었습니다')
+      onClose()
+    }
+    setSaving(false)
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+      <div className="bg-slate-800 rounded-xl border border-slate-700 w-full max-w-md p-6">
+        <h2 className="text-xl font-bold text-white mb-4">콘텐츠 추가</h2>
+        
+        <div className="space-y-4">
+          {/* 키워드 선택/입력 */}
           <div>
-            <label className="block text-sm font-medium text-slate-300 mb-2">발행 URL</label>
-            <div className="flex gap-2">
-              <input
-                type="url"
-                value={formData.url}
-                onChange={(e) => setFormData({ ...formData, url: e.target.value })}
-                className="flex-1 px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
-                placeholder="https://blog.naver.com/..."
-              />
-              <button
-                type="button"
-                onClick={handleAnalyzeUrl}
-                disabled={!formData.url || analyzing}
-                className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm"
-              >
-                {analyzing ? '분석중...' : '분석'}
-              </button>
-            </div>
-            <p className="text-xs text-slate-500 mt-1">URL 입력 후 분석 버튼을 누르면 키워드가 자동 추출됩니다</p>
+            <label className="block text-sm text-slate-400 mb-1">키워드 *</label>
+            {preselectedKeywordId ? (
+              <div className="px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white">
+                {keywords.find(k => k.id === preselectedKeywordId)?.keyword}
+              </div>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  value={keywordInput}
+                  onChange={e => { setKeywordInput(e.target.value); setSelectedKeywordId('') }}
+                  placeholder="키워드 검색 또는 새 키워드 입력"
+                  className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
+                />
+                {keywordInput && filteredKeywords.length > 0 && (
+                  <div className="mt-2 max-h-32 overflow-y-auto bg-slate-700 rounded-lg border border-slate-600">
+                    {filteredKeywords.slice(0, 5).map(k => (
+                      <div
+                        key={k.id}
+                        onClick={() => { setSelectedKeywordId(k.id); setKeywordInput(k.keyword) }}
+                        className={`px-4 py-2 cursor-pointer hover:bg-slate-600 ${
+                          selectedKeywordId === k.id ? 'bg-purple-600/30' : ''
+                        }`}
+                      >
+                        <span className="text-white">{k.keyword}</span>
+                        {k.sub_keyword && <span className="text-slate-500 text-sm ml-2">({k.sub_keyword})</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {keywordInput && !selectedKeywordId && filteredKeywords.length === 0 && (
+                  <p className="text-sm text-emerald-400 mt-1">새 키워드로 추가됩니다</p>
+                )}
+              </>
+            )}
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-300 mb-2">계정</label>
+            <label className="block text-sm text-slate-400 mb-1">URL *</label>
+            <input
+              type="text"
+              value={url}
+              onChange={e => setUrl(e.target.value)}
+              placeholder="https://blog.naver.com/..."
+              className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">제목</label>
+            <input
+              type="text"
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+              placeholder="콘텐츠 제목 (선택)"
+              className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">계정</label>
             <select
-              value={formData.account_id}
-              onChange={(e) => setFormData({ ...formData, account_id: e.target.value })}
+              value={accountId}
+              onChange={e => setAccountId(e.target.value)}
               className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
             >
-              <option value="">미지정</option>
-              {accounts.map(acc => (
-                <option key={acc.id} value={acc.id}>{acc.name}</option>
+              <option value="">선택 안 함</option>
+              {accounts.map(a => (
+                <option key={a.id} value={a.id}>{a.name}</option>
               ))}
             </select>
           </div>
+        </div>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">메인 키워드 *</label>
-              <input
-                type="text"
-                value={formData.keyword}
-                onChange={(e) => setFormData({ ...formData, keyword: e.target.value })}
-                required
-                className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                placeholder="예: 캠핑장"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">서브 키워드</label>
-              <input
-                type="text"
-                value={formData.sub_keyword}
-                onChange={(e) => setFormData({ ...formData, sub_keyword: e.target.value })}
-                className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                placeholder="예: 가평 캠핑장"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">PC 검색량</label>
-              <input
-                type="number"
-                min="0"
-                value={formData.monthly_search_pc}
-                onChange={(e) => setFormData({ ...formData, monthly_search_pc: parseInt(e.target.value) || 0 })}
-                className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">MO 검색량</label>
-              <input
-                type="number"
-                min="0"
-                value={formData.monthly_search_mo}
-                onChange={(e) => setFormData({ ...formData, monthly_search_mo: parseInt(e.target.value) || 0 })}
-                className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">경쟁도</label>
-              <select
-                value={formData.competition}
-                onChange={(e) => setFormData({ ...formData, competition: e.target.value })}
-                className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-              >
-                <option value="알 수 없음">알 수 없음</option>
-                <option value="낮음">낮음</option>
-                <option value="중간">중간</option>
-                <option value="높음">높음</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="flex gap-3 pt-4">
-            <button type="button" onClick={onClose}
-              className="flex-1 px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600">
-              취소
-            </button>
-            <button type="submit" disabled={saving}
-              className="flex-1 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50">
-              {saving ? '저장 중...' : '저장'}
-            </button>
-          </div>
-        </form>
+        <div className="flex justify-end gap-2 mt-6">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600"
+          >
+            취소
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50"
+          >
+            {saving ? '저장 중...' : '추가'}
+          </button>
+        </div>
       </div>
     </div>
   )

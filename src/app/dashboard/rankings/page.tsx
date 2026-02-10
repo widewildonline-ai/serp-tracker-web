@@ -1,21 +1,26 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Keyword, SerpResult } from '@/types/database'
+import { Keyword, Content, Account, SerpResult } from '@/types/database'
 
-type KeywordWithSerp = Keyword & {
-  account: { name: string } | null
+// 콘텐츠 + SERP 타입
+type ContentWithSerp = Content & {
+  keyword?: Pick<Keyword, 'id' | 'keyword' | 'sub_keyword' | 'monthly_search_total' | 'competition'>
+  account?: Pick<Account, 'id' | 'name'> | null
   serp_results: SerpResult[]
 }
 
+// 키워드별 순위 데이터
 interface RankingData {
-  keyword: KeywordWithSerp
+  keyword: Keyword
+  contents: ContentWithSerp[]
   pcRank: number | null
   moRank: number | null
   pcChange: number
   moChange: number
   capturedAt: string
+  accountName: string | null
 }
 
 export default function RankingsPage() {
@@ -26,47 +31,89 @@ export default function RankingsPage() {
 
   const supabase = createClient()
 
-  useEffect(() => {
-    const loadData = async () => {
-      setLoading(true)
+  const loadData = useCallback(async () => {
+    setLoading(true)
 
-      const { data } = await supabase
-        .from('keywords')
-        .select(`
-          *,
-          account:accounts(name),
-          serp_results(*)
-        `)
-        .order('monthly_search_total', { ascending: false })
+    // 키워드 로드
+    const { data: keywords } = await supabase
+      .from('keywords')
+      .select('*')
+      .order('monthly_search_total', { ascending: false })
 
-      if (data) {
-        const processed: RankingData[] = data.map(kw => {
-          const latestSerp = (kw.serp_results || [])
-            .sort((a: SerpResult, b: SerpResult) => 
-              new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
-            )
+    // 콘텐츠 + SERP 로드 (V2 구조)
+    const { data: contents } = await supabase
+      .from('contents')
+      .select(`
+        *,
+        keyword:keywords(id, keyword, sub_keyword, monthly_search_total, competition),
+        account:accounts(id, name),
+        serp_results(*)
+      `)
 
-          const pcSerp = latestSerp.find((s: SerpResult) => s.device === 'PC')
-          const moSerp = latestSerp.find((s: SerpResult) => s.device === 'MO')
+    if (keywords) {
+      const processed: RankingData[] = keywords.map(kw => {
+        // 해당 키워드의 콘텐츠 필터링
+        const kwContents = (contents || [])
+          .filter(c => c.keyword_id === kw.id)
+          .map(c => ({
+            ...c,
+            serp_results: (c.serp_results || [])
+              .sort((a: SerpResult, b: SerpResult) => 
+                new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
+              )
+          })) as ContentWithSerp[]
 
-          return {
-            keyword: kw as KeywordWithSerp,
-            pcRank: pcSerp?.rank ?? null,
-            moRank: moSerp?.rank ?? null,
-            pcChange: pcSerp?.rank_change ?? 0,
-            moChange: moSerp?.rank_change ?? 0,
-            capturedAt: pcSerp?.captured_at || moSerp?.captured_at || '',
+        // 모든 콘텐츠 중 최고 순위 찾기
+        let bestPcRank: number | null = null
+        let bestMoRank: number | null = null
+        let bestPcChange = 0
+        let bestMoChange = 0
+        let capturedAt = ''
+        let accountName: string | null = null
+
+        kwContents.forEach(content => {
+          const pcSerp = content.serp_results?.find(r => r.device === 'PC')
+          const moSerp = content.serp_results?.find(r => r.device === 'MO')
+
+          if (pcSerp?.rank !== null && pcSerp?.rank !== undefined) {
+            if (bestPcRank === null || pcSerp.rank < bestPcRank) {
+              bestPcRank = pcSerp.rank
+              bestPcChange = pcSerp.rank_change || 0
+              capturedAt = pcSerp.captured_at || ''
+              accountName = content.account?.name || null
+            }
+          }
+          if (moSerp?.rank !== null && moSerp?.rank !== undefined) {
+            if (bestMoRank === null || moSerp.rank < bestMoRank) {
+              bestMoRank = moSerp.rank
+              bestMoChange = moSerp.rank_change || 0
+              if (!capturedAt) capturedAt = moSerp.captured_at || ''
+              if (!accountName) accountName = content.account?.name || null
+            }
           }
         })
 
-        setRankings(processed)
-      }
+        return {
+          keyword: kw,
+          contents: kwContents,
+          pcRank: bestPcRank,
+          moRank: bestMoRank,
+          pcChange: bestPcChange,
+          moChange: bestMoChange,
+          capturedAt,
+          accountName,
+        }
+      })
 
-      setLoading(false)
+      setRankings(processed)
     }
 
-    loadData()
+    setLoading(false)
   }, [supabase])
+
+  useEffect(() => {
+    loadData()
+  }, [loadData])
 
   // 필터링
   const filteredRankings = rankings.filter(r => {
@@ -166,7 +213,7 @@ export default function RankingsPage() {
                     <span className="text-2xl font-bold text-slate-600">#{idx + 1}</span>
                     <div>
                       <p className="text-white font-medium">{r.keyword.keyword}</p>
-                      <p className="text-slate-500 text-xs">{r.keyword.account?.name || '미지정'}</p>
+                      <p className="text-slate-500 text-xs">{r.accountName || '미지정'}</p>
                     </div>
                   </div>
                   <div className="text-right">
@@ -203,7 +250,7 @@ export default function RankingsPage() {
                     <span className="text-2xl font-bold text-slate-600">#{idx + 1}</span>
                     <div>
                       <p className="text-white font-medium">{r.keyword.keyword}</p>
-                      <p className="text-slate-500 text-xs">{r.keyword.account?.name || '미지정'}</p>
+                      <p className="text-slate-500 text-xs">{r.accountName || '미지정'}</p>
                     </div>
                   </div>
                   <div className="text-right">
@@ -301,7 +348,7 @@ export default function RankingsPage() {
                       </div>
                     </td>
                     <td className="px-4 py-3">
-                      <span className="text-slate-400 text-sm">{r.keyword.account?.name || '-'}</span>
+                      <span className="text-slate-400 text-sm">{r.accountName || '-'}</span>
                     </td>
                     <td className="px-4 py-3 text-right">
                       <span className="text-white font-mono text-sm">

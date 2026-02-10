@@ -2,19 +2,26 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Account, Keyword, SerpResult, Json } from '@/types/database'
+import { Account, Keyword, Content, SerpResult, Json } from '@/types/database'
 
-type KeywordWithSerp = Keyword & {
-  account: Pick<Account, 'id' | 'name' | 'blog_score'> | null
+// 콘텐츠 + SERP 결과
+type ContentWithSerp = Content & {
+  account?: Pick<Account, 'id' | 'name' | 'blog_score'> | null
   serp_results: SerpResult[]
 }
 
+// 키워드 + 콘텐츠 목록
+type KeywordWithContents = Keyword & {
+  contents: ContentWithSerp[]
+}
+
+// 발행 추천 아이템
 interface Recommendation {
-  keyword: KeywordWithSerp
+  keyword: Keyword
+  contents: ContentWithSerp[]
   status: 'urgent' | 'recovery' | 'new'
   reason: string
   recommendedAccount: Account | null
-  expectedImpact: number
   exposureProb: number
 }
 
@@ -53,7 +60,7 @@ export default function RecommendationsPage() {
     return settings.low_limit
   }
 
-  // 노출 확률 계산
+  // 노출 확률 계산 (계정 지수 + 경쟁도 기반)
   const getExposureProb = (accountScore: number, competition: string, settings: DailyLimitsSettings | null) => {
     const matrix: Record<string, Record<string, number>> = {
       '낮음': { high: 0.95, medium: 0.75, low: 0.50 },
@@ -65,28 +72,11 @@ export default function RecommendationsPage() {
     return matrix[competition]?.[tier] || 0.3
   }
 
-  // 기대 효과 점수 계산
-  const calcExpectedImpact = (
-    exposureProb: number,
-    totalVolume: number,
-    status: 'urgent' | 'recovery' | 'new'
-  ) => {
-    const volumeValue = totalVolume > 0 ? Math.log10(totalVolume + 10) : 0.5
-    const statusWeight = status === 'urgent' ? 2.0 : status === 'recovery' ? 1.5 : 1.0
-    return Math.round(exposureProb * volumeValue * statusWeight * 100)
-  }
-
   // 최적 계정 추천
   const findBestAccount = (
     competition: string,
-    originalAccount: Account | null,
-    allAccounts: Account[],
-    status: 'urgent' | 'recovery' | 'new'
+    allAccounts: Account[]
   ): Account | null => {
-    if ((status === 'urgent' || status === 'recovery') && originalAccount) {
-      return originalAccount
-    }
-
     const ranges: Record<string, [number, number]> = {
       '높음': [60, 100],
       '중간': [35, 69],
@@ -104,78 +94,81 @@ export default function RecommendationsPage() {
     return allAccounts.sort((a, b) => b.blog_score - a.blog_score)[0] || null
   }
 
-  // 추천 생성 (순수 함수로 변경)
+  // 추천 생성
   const generateRecommendations = (
-    keywords: KeywordWithSerp[],
+    keywordsWithContents: KeywordWithContents[],
     allAccounts: Account[],
     settings: DailyLimitsSettings | null
   ): Recommendation[] => {
     const recs: Recommendation[] = []
 
-    for (const kw of keywords) {
-      const pcSerp = kw.serp_results?.find(r => r.device === 'PC')
-      const moSerp = kw.serp_results?.find(r => r.device === 'MO')
+    for (const kw of keywordsWithContents) {
+      // 활성 콘텐츠 필터링
+      const activeContents = kw.contents.filter(c => c.is_active)
       
-      const pcRank = pcSerp?.rank ?? null
-      const moRank = moSerp?.rank ?? null
-      const pcChange = pcSerp?.rank_change || 0
-      const moChange = moSerp?.rank_change || 0
-      
-      const isUnexposed = pcRank === null && moRank === null
-      const wasExposed = pcChange < -10 || moChange < -10
+      // 활성 콘텐츠 중 노출 중인 것 확인
+      const exposedContents = activeContents.filter(c => {
+        const pcSerp = c.serp_results?.find(r => r.device === 'PC')
+        const moSerp = c.serp_results?.find(r => r.device === 'MO')
+        return pcSerp?.is_exposed || moSerp?.is_exposed
+      })
+
+      // 비활성 콘텐츠 (미노출로 추적 중지된 것)
+      const inactiveContents = kw.contents.filter(c => !c.is_active)
 
       let status: 'urgent' | 'recovery' | 'new' | null = null
       let reason = ''
 
-      if (isUnexposed && wasExposed) {
+      // 케이스 1: 활성 콘텐츠가 있었는데 모두 미노출 → 긴급
+      if (activeContents.length > 0 && exposedContents.length === 0) {
         status = 'urgent'
-        reason = '이전 노출 → 미노출 (긴급 복구 필요)'
-      } else if (isUnexposed && kw.url) {
+        reason = `${activeContents.length}개 콘텐츠 모두 미노출`
+      }
+      // 케이스 2: 비활성 콘텐츠만 있음 (이전에 노출됐다가 미노출) → 복구
+      else if (activeContents.length === 0 && inactiveContents.length > 0) {
         status = 'recovery'
-        reason = 'URL 있으나 미노출 (복구 필요)'
-      } else if (!kw.url) {
+        reason = `이전 ${inactiveContents.length}개 콘텐츠 미노출 (추적 중지됨)`
+      }
+      // 케이스 3: 콘텐츠가 아예 없음 → 신규
+      else if (kw.contents.length === 0) {
         status = 'new'
         reason = '미발행 키워드 (신규 발행 추천)'
       }
 
+      // 노출 중인 콘텐츠가 있으면 추천하지 않음
       if (!status) continue
 
-      const accountScore = kw.account?.blog_score || 0
-      const exposureProb = getExposureProb(accountScore, kw.competition, settings)
-      const expectedImpact = calcExpectedImpact(exposureProb, kw.monthly_search_total, status)
-
-      const recommendedAccount = findBestAccount(
-        kw.competition,
-        kw.account as Account | null,
-        allAccounts,
-        status
-      )
+      const recommendedAccount = findBestAccount(kw.competition, allAccounts)
+      const exposureProb = recommendedAccount 
+        ? getExposureProb(recommendedAccount.blog_score, kw.competition, settings)
+        : 0.3
 
       recs.push({
         keyword: kw,
+        contents: kw.contents,
         status,
         reason,
         recommendedAccount,
-        expectedImpact,
         exposureProb,
       })
     }
 
-    return recs.sort((a, b) => b.expectedImpact - a.expectedImpact)
+    // 검색량 순으로 정렬
+    return recs.sort((a, b) => b.keyword.monthly_search_total - a.keyword.monthly_search_total)
   }
 
-  // 데이터 로드 함수
+  // 데이터 로드
   const loadData = useCallback(async () => {
-      setLoading(true)
+    setLoading(true)
 
-      // 설정 로드
-      const { data: settingsData } = await supabase
-        .from('settings')
-        .select('value')
-        .eq('key', 'daily_publish_limits')
-        .single()
-      
-      const loadedSettings = settingsData?.value as DailyLimitsSettings | null
+    // 설정 로드
+    const { data: settingsData } = await supabase
+      .from('settings')
+      .select('value')
+      .eq('key', 'daily_publish_limits')
+      .single()
+    
+    const loadedSettings = settingsData?.value as DailyLimitsSettings | null
 
     // 마지막 분석 시간 로드
     const { data: lastAnalysis } = await supabase
@@ -188,44 +181,55 @@ export default function RecommendationsPage() {
       setLastAnalyzedAt((lastAnalysis.value as { timestamp: string }).timestamp)
     }
 
-      // 계정 로드
-      const { data: accountsData } = await supabase
-        .from('accounts')
-        .select('*')
-        .order('blog_score', { ascending: false })
+    // 계정 로드
+    const { data: accountsData } = await supabase
+      .from('accounts')
+      .select('*')
+      .order('blog_score', { ascending: false })
 
-      // 키워드 + SERP 로드
-      const { data: keywordsData } = await supabase
-        .from('keywords')
-        .select(`
-          *,
-          account:accounts(id, name, blog_score),
-          serp_results(*)
-        `)
-        .order('monthly_search_total', { ascending: false })
+    // 키워드 로드
+    const { data: keywordsData } = await supabase
+      .from('keywords')
+      .select('*')
+      .order('monthly_search_total', { ascending: false })
 
-      if (keywordsData && accountsData) {
-        const processed = keywordsData.map(kw => ({
-          ...kw,
-          serp_results: (kw.serp_results || [])
+    // 콘텐츠 + SERP 로드
+    const { data: contentsData } = await supabase
+      .from('contents')
+      .select(`
+        *,
+        account:accounts(id, name, blog_score),
+        serp_results(*)
+      `)
+
+    // 키워드별로 콘텐츠 그룹화
+    const keywordsWithContents: KeywordWithContents[] = (keywordsData || []).map(kw => ({
+      ...kw,
+      contents: (contentsData || [])
+        .filter(c => c.keyword_id === kw.id)
+        .map(c => ({
+          ...c,
+          serp_results: (c.serp_results || [])
             .sort((a: SerpResult, b: SerpResult) => 
               new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
             )
             .slice(0, 2)
         }))
-        
-        const recs = generateRecommendations(
-          processed as KeywordWithSerp[], 
-          accountsData, 
-          loadedSettings
-        )
-        
-        setDailyLimits(loadedSettings)
-        setAccounts(accountsData || [])
-        setRecommendations(recs)
-      }
+    }))
 
-      setLoading(false)
+    if (accountsData) {
+      const recs = generateRecommendations(
+        keywordsWithContents,
+        accountsData,
+        loadedSettings
+      )
+      
+      setDailyLimits(loadedSettings)
+      setAccounts(accountsData || [])
+      setRecommendations(recs)
+    }
+
+    setLoading(false)
   }, [supabase])
 
   // 수동 분석 실행
@@ -245,17 +249,13 @@ export default function RecommendationsPage() {
         
         // EC2 서버에 분석 요청
         try {
-          const response = await fetch(`${config.base_url}/run-analysis`, {
+          await fetch(`${config.base_url}/run-analysis`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ secret: config.secret }),
           })
-
-          if (!response.ok) {
-            console.warn('EC2 분석 요청 실패, 로컬 분석 수행')
-          }
         } catch (e) {
-          console.warn('EC2 서버 연결 실패, 로컬 분석 수행')
+          console.warn('EC2 서버 연결 실패')
         }
       }
 
@@ -271,6 +271,7 @@ export default function RecommendationsPage() {
       setLastAnalyzedAt(now)
 
       // 데이터 새로고침
+      dataLoadedRef.current = false
       await loadData()
 
     } catch (error) {
@@ -366,12 +367,12 @@ export default function RecommendationsPage() {
             <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4">
               <p className="text-red-400 text-sm">🚨 긴급 복구</p>
               <p className="text-2xl font-bold text-white mt-1">{stats.urgent}</p>
-              <p className="text-slate-500 text-xs">이전 노출 → 미노출</p>
+              <p className="text-slate-500 text-xs">활성 콘텐츠 모두 미노출</p>
             </div>
             <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4">
               <p className="text-yellow-400 text-sm">⚠️ 복구 필요</p>
               <p className="text-2xl font-bold text-white mt-1">{stats.recovery}</p>
-              <p className="text-slate-500 text-xs">URL 있으나 미노출</p>
+              <p className="text-slate-500 text-xs">이전 콘텐츠 추적 중지됨</p>
             </div>
             <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4">
               <p className="text-blue-400 text-sm">✨ 신규 추천</p>
@@ -381,7 +382,7 @@ export default function RecommendationsPage() {
             <div className="bg-purple-500/10 border border-purple-500/30 rounded-xl p-4">
               <p className="text-purple-400 text-sm">📊 전체 추천</p>
               <p className="text-2xl font-bold text-white mt-1">{stats.total}</p>
-              <p className="text-slate-500 text-xs">기대효과 순 정렬</p>
+              <p className="text-slate-500 text-xs">검색량 순 정렬</p>
             </div>
           </div>
 
@@ -421,7 +422,7 @@ export default function RecommendationsPage() {
           <div className="bg-slate-800/50 rounded-xl border border-slate-700 overflow-hidden">
             <div className="px-6 py-4 border-b border-slate-700">
               <h2 className="text-lg font-semibold text-white">📝 발행 추천 목록</h2>
-              <p className="text-slate-500 text-sm">기대효과 점수 순으로 정렬됨</p>
+              <p className="text-slate-500 text-sm">검색량 순으로 정렬됨</p>
             </div>
 
             {recommendations.length === 0 ? (
@@ -439,10 +440,9 @@ export default function RecommendationsPage() {
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-400 uppercase">키워드</th>
                       <th className="px-4 py-3 text-right text-xs font-medium text-slate-400 uppercase">검색량</th>
                       <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">경쟁</th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-400 uppercase">현재 계정</th>
+                      <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">콘텐츠</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-400 uppercase">추천 계정</th>
                       <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">노출확률</th>
-                      <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">기대효과</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-400 uppercase">사유</th>
                     </tr>
                   </thead>
@@ -481,19 +481,14 @@ export default function RecommendationsPage() {
                             {rec.keyword.competition}
                           </span>
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="px-4 py-3 text-center">
                           <span className="text-slate-400 text-sm">
-                            {rec.keyword.account?.name || '-'}
+                            {rec.contents.length}개
                           </span>
                         </td>
                         <td className="px-4 py-3">
-                          <span className={`text-sm font-medium ${
-                            rec.recommendedAccount?.id !== rec.keyword.account?.id 
-                              ? 'text-purple-400' 
-                              : 'text-slate-400'
-                          }`}>
+                          <span className="text-purple-400 font-medium text-sm">
                             {rec.recommendedAccount?.name || '-'}
-                            {rec.recommendedAccount?.id !== rec.keyword.account?.id && ' ⬅️'}
                           </span>
                         </td>
                         <td className="px-4 py-3 text-center">
@@ -506,15 +501,6 @@ export default function RecommendationsPage() {
                             </div>
                             <span className="text-slate-400 text-xs">{Math.round(rec.exposureProb * 100)}%</span>
                           </div>
-                        </td>
-                        <td className="px-4 py-3 text-center">
-                          <span className={`font-bold ${
-                            rec.expectedImpact >= 200 ? 'text-emerald-400' :
-                            rec.expectedImpact >= 100 ? 'text-yellow-400' :
-                            'text-slate-400'
-                          }`}>
-                            {rec.expectedImpact}
-                          </span>
                         </td>
                         <td className="px-4 py-3">
                           <span className="text-slate-500 text-xs">{rec.reason}</span>

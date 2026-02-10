@@ -2,34 +2,18 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
+import { Keyword, Content, Account, SerpResult } from '@/types/database'
 
-interface PublishRecord {
-  id: string
-  main_keyword: string
-  sub_keyword: string | null
-  title: string
-  source_file: string | null
-  account_name: string
-  published_date: string | null
-  camfit_link: boolean
-  url: string | null
-  rank_24h: string | null
-  rank_pc: number | null
-  rank_mo: number | null
-  rank_change_pc: number
-  rank_change_mo: number
-  search_pc: number
-  search_mo: number
-  search_total: number
-  competition: string
-  mobile_ratio: number
-  opportunity_score: number
-  data_date: string | null
-  created_at: string
+// 콘텐츠 + 키워드 + 계정 + SERP (V2 구조)
+type ContentWithRelations = Content & {
+  keyword?: Pick<Keyword, 'id' | 'keyword' | 'sub_keyword' | 'monthly_search_total' | 'competition' | 'mobile_ratio'>
+  account?: Pick<Account, 'id' | 'name'> | null
+  serp_results: SerpResult[]
 }
 
 export default function PublishPage() {
-  const [records, setRecords] = useState<PublishRecord[]>([])
+  const [contents, setContents] = useState<ContentWithRelations[]>([])
+  const [accounts, setAccounts] = useState<Account[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState({
@@ -41,51 +25,96 @@ export default function PublishPage() {
   
   const supabase = createClient()
 
-  // 데이터 로드
+  // 데이터 로드 (V2 구조: contents 테이블 기반)
   const loadData = useCallback(async () => {
     setLoading(true)
     setError(null)
     
-    let query = supabase
-      .from('publish_records')
+    // 계정 로드
+    const { data: accountsData } = await supabase
+      .from('accounts')
       .select('*')
+      .order('name')
+    
+    setAccounts(accountsData || [])
+    
+    // 콘텐츠 + 키워드 + 계정 + SERP 로드
+    const { data, error: err } = await supabase
+      .from('contents')
+      .select(`
+        *,
+        keyword:keywords(id, keyword, sub_keyword, monthly_search_total, competition, mobile_ratio),
+        account:accounts(id, name),
+        serp_results(*)
+      `)
       .order('published_date', { ascending: false })
       .limit(500)
     
-    if (filter.account) {
-      query = query.eq('account_name', filter.account)
-    }
-    if (filter.keyword) {
-      query = query.or(`main_keyword.ilike.%${filter.keyword}%,sub_keyword.ilike.%${filter.keyword}%,title.ilike.%${filter.keyword}%`)
-    }
-    
-    const { data, error: err } = await query
-    
     if (err) {
       setError('데이터 로드 실패: ' + err.message)
-      setRecords([])
+      setContents([])
     } else {
-      let filtered = data || []
+      // 콘텐츠 데이터 가공
+      let processed = (data || []).map(c => ({
+        ...c,
+        serp_results: (c.serp_results || [])
+          .sort((a: SerpResult, b: SerpResult) => 
+            new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
+          )
+          .slice(0, 2) // PC, MO 최신 결과만
+      })) as ContentWithRelations[]
+      
+      // 계정 필터
+      if (filter.account) {
+        processed = processed.filter(c => c.account?.id === filter.account)
+      }
+      
+      // 키워드/제목 필터
+      if (filter.keyword) {
+        const searchLower = filter.keyword.toLowerCase()
+        processed = processed.filter(c => 
+          c.keyword?.keyword?.toLowerCase().includes(searchLower) ||
+          c.keyword?.sub_keyword?.toLowerCase().includes(searchLower) ||
+          c.title?.toLowerCase().includes(searchLower)
+        )
+      }
       
       // 노출 필터
       if (filter.exposed === 'exposed') {
-        filtered = filtered.filter(r => r.rank_pc !== null || r.rank_mo !== null)
+        processed = processed.filter(c => {
+          const pcSerp = c.serp_results?.find(r => r.device === 'PC')
+          const moSerp = c.serp_results?.find(r => r.device === 'MO')
+          return pcSerp?.rank !== null || moSerp?.rank !== null
+        })
       } else if (filter.exposed === 'unexposed') {
-        filtered = filtered.filter(r => r.rank_pc === null && r.rank_mo === null)
+        processed = processed.filter(c => {
+          const pcSerp = c.serp_results?.find(r => r.device === 'PC')
+          const moSerp = c.serp_results?.find(r => r.device === 'MO')
+          return (pcSerp?.rank === null || pcSerp?.rank === undefined) && 
+                 (moSerp?.rank === null || moSerp?.rank === undefined)
+        })
       }
       
       // 정렬
       if (sortBy === 'volume') {
-        filtered = filtered.sort((a, b) => b.search_total - a.search_total)
+        processed = processed.sort((a, b) => 
+          (b.keyword?.monthly_search_total || 0) - (a.keyword?.monthly_search_total || 0)
+        )
       } else if (sortBy === 'rank') {
-        filtered = filtered.sort((a, b) => {
-          const aRank = Math.min(a.rank_pc ?? 999, a.rank_mo ?? 999)
-          const bRank = Math.min(b.rank_pc ?? 999, b.rank_mo ?? 999)
+        processed = processed.sort((a, b) => {
+          const aRank = Math.min(
+            a.serp_results?.find(r => r.device === 'PC')?.rank ?? 999,
+            a.serp_results?.find(r => r.device === 'MO')?.rank ?? 999
+          )
+          const bRank = Math.min(
+            b.serp_results?.find(r => r.device === 'PC')?.rank ?? 999,
+            b.serp_results?.find(r => r.device === 'MO')?.rank ?? 999
+          )
           return aRank - bRank
         })
       }
       
-      setRecords(filtered)
+      setContents(processed)
     }
     
     setLoading(false)
@@ -95,15 +124,29 @@ export default function PublishPage() {
     loadData()
   }, [loadData])
 
-  // 고유 계정 목록
-  const accountList = [...new Set(records.map(r => r.account_name))].filter(Boolean).sort()
+  // SERP 결과에서 순위 가져오기
+  const getRankInfo = (content: ContentWithRelations, device: 'PC' | 'MO') => {
+    const serp = content.serp_results?.find(r => r.device === device)
+    return {
+      rank: serp?.rank ?? null,
+      change: serp?.rank_change ?? 0
+    }
+  }
 
   // 통계
   const stats = {
-    total: records.length,
-    exposed: records.filter(r => r.rank_pc !== null || r.rank_mo !== null).length,
-    unexposed: records.filter(r => r.rank_pc === null && r.rank_mo === null).length,
-    camfit: records.filter(r => r.camfit_link).length,
+    total: contents.length,
+    exposed: contents.filter(c => {
+      const pc = getRankInfo(c, 'PC')
+      const mo = getRankInfo(c, 'MO')
+      return pc.rank !== null || mo.rank !== null
+    }).length,
+    unexposed: contents.filter(c => {
+      const pc = getRankInfo(c, 'PC')
+      const mo = getRankInfo(c, 'MO')
+      return pc.rank === null && mo.rank === null
+    }).length,
+    camfit: contents.filter(c => c.camfit_link).length,
   }
 
   return (
@@ -111,7 +154,7 @@ export default function PublishPage() {
       {/* 헤더 */}
       <div className="flex items-center justify-between flex-wrap gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-white">발행 기록</h1>
+          <h1 className="text-2xl font-bold text-white">발행 콘텐츠</h1>
           <p className="text-slate-400 mt-1">
             총 {stats.total}개 · 노출 {stats.exposed}개 · 미노출 {stats.unexposed}개
           </p>
@@ -128,7 +171,7 @@ export default function PublishPage() {
       {/* 통계 카드 */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
-          <p className="text-slate-400 text-sm">전체 발행</p>
+          <p className="text-slate-400 text-sm">전체 콘텐츠</p>
           <p className="text-2xl font-bold text-white mt-1">{stats.total}</p>
         </div>
         <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-xl p-4">
@@ -164,8 +207,8 @@ export default function PublishPage() {
             className="px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
           >
             <option value="">전체 계정</option>
-            {accountList.map(acc => (
-              <option key={acc} value={acc}>{acc}</option>
+            {accounts.map(acc => (
+              <option key={acc.id} value={acc.id}>{acc.name}</option>
             ))}
           </select>
           <select
@@ -203,11 +246,11 @@ export default function PublishPage() {
             <div className="animate-spin w-8 h-8 border-2 border-purple-500 border-t-transparent rounded-full mx-auto mb-4" />
             로딩 중...
           </div>
-        ) : records.length === 0 ? (
+        ) : contents.length === 0 ? (
           <div className="p-8 text-center text-slate-400">
             <p className="text-4xl mb-4">📝</p>
-            <p>발행 기록이 없습니다</p>
-            <p className="text-sm mt-2">데이터 마이그레이션이 필요할 수 있습니다</p>
+            <p>발행된 콘텐츠가 없습니다</p>
+            <p className="text-sm mt-2">키워드 관리에서 콘텐츠를 추가하세요</p>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -221,65 +264,72 @@ export default function PublishPage() {
                   <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">PC</th>
                   <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">MO</th>
                   <th className="px-4 py-3 text-right text-xs font-medium text-slate-400 uppercase">검색량</th>
-                  <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">캠핏</th>
+                  <th className="px-4 py-3 text-center text-xs font-medium text-slate-400 uppercase">상태</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-700/50">
-                {records.map((record) => (
-                  <tr key={record.id} className="hover:bg-slate-700/30">
-                    <td className="px-4 py-3">
-                      <span className="text-slate-400 text-sm">
-                        {record.published_date || '-'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className="text-xs bg-slate-700 text-slate-300 px-2 py-1 rounded">
-                        {record.account_name}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div>
-                        <p className="text-white text-sm">{record.main_keyword}</p>
-                        {record.sub_keyword && (
-                          <p className="text-slate-500 text-xs">{record.sub_keyword}</p>
+                {contents.map((content) => {
+                  const pcInfo = getRankInfo(content, 'PC')
+                  const moInfo = getRankInfo(content, 'MO')
+                  
+                  return (
+                    <tr key={content.id} className="hover:bg-slate-700/30">
+                      <td className="px-4 py-3">
+                        <span className="text-slate-400 text-sm">
+                          {content.published_date || '-'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="text-xs bg-slate-700 text-slate-300 px-2 py-1 rounded">
+                          {content.account?.name || '-'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div>
+                          <p className="text-white text-sm">{content.keyword?.keyword || '-'}</p>
+                          {content.keyword?.sub_keyword && (
+                            <p className="text-slate-500 text-xs">{content.keyword.sub_keyword}</p>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 max-w-[300px]">
+                        {content.url ? (
+                          <a 
+                            href={content.url} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="text-purple-400 hover:text-purple-300 text-sm truncate block"
+                            title={content.title || content.url}
+                          >
+                            {content.title ? content.title.substring(0, 40) + '...' : '링크'}
+                          </a>
+                        ) : (
+                          <span className="text-slate-400 text-sm truncate block">
+                            {content.title ? content.title.substring(0, 40) + '...' : '-'}
+                          </span>
                         )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 max-w-[300px]">
-                      {record.url ? (
-                        <a 
-                          href={record.url} 
-                          target="_blank" 
-                          rel="noopener noreferrer"
-                          className="text-purple-400 hover:text-purple-300 text-sm truncate block"
-                          title={record.title}
-                        >
-                          {record.title.substring(0, 40)}...
-                        </a>
-                      ) : (
-                        <span className="text-slate-400 text-sm truncate block">{record.title.substring(0, 40)}...</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      <RankBadge rank={record.rank_pc} change={record.rank_change_pc} />
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      <RankBadge rank={record.rank_mo} change={record.rank_change_mo} />
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <span className="text-white font-mono text-sm">
-                        {record.search_total.toLocaleString()}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      {record.camfit_link ? (
-                        <span className="text-emerald-400">✓</span>
-                      ) : (
-                        <span className="text-slate-500">-</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        <RankBadge rank={pcInfo.rank} change={pcInfo.change} />
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        <RankBadge rank={moInfo.rank} change={moInfo.change} />
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <span className="text-white font-mono text-sm">
+                          {content.keyword?.monthly_search_total?.toLocaleString() || '-'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        {content.is_active ? (
+                          <span className="text-emerald-400 text-xs">추적 중</span>
+                        ) : (
+                          <span className="text-slate-500 text-xs">중지됨</span>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>

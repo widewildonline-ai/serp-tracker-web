@@ -1,7 +1,24 @@
 import { createClient } from '@/lib/supabase/server'
-import { Account, Keyword, SerpResult } from '@/types/database'
+import { Account, Keyword, Content, SerpResult } from '@/types/database'
 import Link from 'next/link'
 import DashboardActions from '@/components/DashboardActions'
+
+// 콘텐츠 + SERP 타입
+type ContentWithSerp = Content & {
+  keyword?: Pick<Keyword, 'id' | 'keyword' | 'sub_keyword' | 'monthly_search_total' | 'competition'>
+  account?: Pick<Account, 'id' | 'name'> | null
+  serp_results: SerpResult[]
+}
+
+// 키워드 + 콘텐츠 통계
+type KeywordWithStats = Keyword & {
+  contents: ContentWithSerp[]
+  pcRank: number | null
+  moRank: number | null
+  pcChange: number
+  moChange: number
+  accountName: string | null
+}
 
 export default async function DashboardPage() {
   const supabase = await createClient()
@@ -12,17 +29,24 @@ export default async function DashboardPage() {
     .select('*')
     .order('blog_score', { ascending: false })
   
-  // 키워드 + SERP 데이터
+  // 키워드 데이터
   const { data: keywords, error: keywordsError } = await supabase
     .from('keywords')
+    .select('*')
+    .order('monthly_search_total', { ascending: false })
+  
+  // 콘텐츠 + SERP 데이터 (V2 구조)
+  const { data: contents, error: contentsError } = await supabase
+    .from('contents')
     .select(`
       *,
+      keyword:keywords(id, keyword, sub_keyword, monthly_search_total, competition),
       account:accounts(id, name),
       serp_results(*)
     `)
-    .order('monthly_search_total', { ascending: false })
+    .eq('is_active', true)
   
-  const hasError = accountsError || keywordsError
+  const hasError = accountsError || keywordsError || contentsError
   
   // 통계 계산
   const totalAccounts = accounts?.length || 0
@@ -31,20 +55,53 @@ export default async function DashboardPage() {
     ? Math.round((accounts as Account[]).reduce((sum, a) => sum + (a.blog_score || 0), 0) / totalAccounts)
     : 0
 
-  // SERP 통계
-  const keywordsWithSerp = (keywords || []).map(kw => {
-    const latestSerp = (kw.serp_results || [])
-      .sort((a: SerpResult, b: SerpResult) => 
-        new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
-      )
-    const pcSerp = latestSerp.find((s: SerpResult) => s.device === 'PC')
-    const moSerp = latestSerp.find((s: SerpResult) => s.device === 'MO')
+  // 키워드별 콘텐츠 그룹화 및 SERP 통계 계산
+  const keywordsWithSerp: KeywordWithStats[] = (keywords || []).map(kw => {
+    const kwContents = (contents || [])
+      .filter(c => c.keyword_id === kw.id)
+      .map(c => ({
+        ...c,
+        serp_results: (c.serp_results || [])
+          .sort((a: SerpResult, b: SerpResult) => 
+            new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime()
+          )
+      })) as ContentWithSerp[]
+    
+    // 해당 키워드의 모든 콘텐츠 중 최고 순위 찾기
+    let bestPcRank: number | null = null
+    let bestMoRank: number | null = null
+    let bestPcChange = 0
+    let bestMoChange = 0
+    let accountName: string | null = null
+    
+    kwContents.forEach(content => {
+      const pcSerp = content.serp_results?.find(r => r.device === 'PC')
+      const moSerp = content.serp_results?.find(r => r.device === 'MO')
+      
+      if (pcSerp?.rank !== null && pcSerp?.rank !== undefined) {
+        if (bestPcRank === null || pcSerp.rank < bestPcRank) {
+          bestPcRank = pcSerp.rank
+          bestPcChange = pcSerp.rank_change || 0
+          accountName = content.account?.name || null
+        }
+      }
+      if (moSerp?.rank !== null && moSerp?.rank !== undefined) {
+        if (bestMoRank === null || moSerp.rank < bestMoRank) {
+          bestMoRank = moSerp.rank
+          bestMoChange = moSerp.rank_change || 0
+          if (!accountName) accountName = content.account?.name || null
+        }
+      }
+    })
+    
     return {
       ...kw,
-      pcRank: pcSerp?.rank ?? null,
-      moRank: moSerp?.rank ?? null,
-      pcChange: pcSerp?.rank_change ?? 0,
-      moChange: moSerp?.rank_change ?? 0,
+      contents: kwContents,
+      pcRank: bestPcRank,
+      moRank: bestMoRank,
+      pcChange: bestPcChange,
+      moChange: bestMoChange,
+      accountName,
     }
   })
 
@@ -196,7 +253,7 @@ export default async function DashboardPage() {
                 <div key={k.id} className="px-6 py-3 flex items-center justify-between">
                   <div>
                     <p className="text-white text-sm">{k.keyword}</p>
-                    <p className="text-slate-500 text-xs">{(k as { account?: { name: string } }).account?.name || '미지정'}</p>
+                    <p className="text-slate-500 text-xs">{k.accountName || '미지정'}</p>
                   </div>
                   <span className="text-slate-400 text-xs">
                     {k.monthly_search_total?.toLocaleString() || 0}

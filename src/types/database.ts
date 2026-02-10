@@ -1,4 +1,5 @@
-// Supabase 테이블 타입 정의
+// Supabase 테이블 타입 정의 V2
+// 키워드:콘텐츠 1:N 구조
 
 // JSON 타입 (Supabase jsonb 컬럼용)
 export type Json =
@@ -9,6 +10,9 @@ export type Json =
   | { [key: string]: Json | undefined }
   | Json[]
 
+// ============================================
+// 1. accounts (계정)
+// ============================================
 export interface Account {
   id: string
   name: string
@@ -20,12 +24,13 @@ export interface Account {
   updated_at: string
 }
 
+// ============================================
+// 2. keywords (키워드 - 검색량/경쟁도 정보)
+// ============================================
 export interface Keyword {
   id: string
-  account_id: string | null
-  keyword: string
+  keyword: string           // 메인 키워드 (UNIQUE)
   sub_keyword: string | null
-  url: string | null
   monthly_search_pc: number
   monthly_search_mo: number
   monthly_search_total: number
@@ -37,18 +42,47 @@ export interface Keyword {
   updated_at: string
 }
 
-export interface SerpResult {
+// ============================================
+// 3. contents (발행된 콘텐츠)
+// ============================================
+export interface Content {
   id: string
   keyword_id: string
+  account_id: string | null
+  url: string
+  title: string | null
+  published_date: string | null
+  is_active: boolean        // 순위 추적 여부
+  camfit_link: boolean
+  source_file: string | null
+  created_at: string
+  updated_at: string
+}
+
+// 콘텐츠 + 관계 데이터
+export interface ContentWithRelations extends Content {
+  keyword?: Pick<Keyword, 'id' | 'keyword' | 'sub_keyword' | 'monthly_search_total' | 'competition'>
+  account?: Pick<Account, 'id' | 'name'> | null
+  serp_results?: SerpResult[]
+}
+
+// ============================================
+// 4. serp_results (콘텐츠별 SERP 결과)
+// ============================================
+export interface SerpResult {
+  id: string
+  content_id: string        // keyword_id → content_id 변경
   device: 'PC' | 'MO'
   rank: number | null
   rank_change: number
-  url: string | null
   is_exposed: boolean
   captured_at: string
   created_at: string
 }
 
+// ============================================
+// 5. settings (설정)
+// ============================================
 export interface Setting {
   id: string
   key: string
@@ -57,7 +91,33 @@ export interface Setting {
   updated_at: string
 }
 
+// ============================================
+// 확장 타입 (UI용)
+// ============================================
+
+// 키워드 + 콘텐츠 목록
+export interface KeywordWithContents extends Keyword {
+  contents: ContentWithRelations[]
+  // 집계 데이터
+  totalContents: number
+  activeContents: number
+  exposedContents: number
+}
+
+// 발행 추천 아이템
+export interface PublishRecommendation {
+  keyword: Keyword
+  contents: ContentWithRelations[]
+  status: 'urgent' | 'recovery' | 'new'  // 긴급/복구/신규
+  reason: string
+  recommendedAccount: Account | null
+  expectedImpact: number
+  exposureProb: number
+}
+
+// ============================================
 // 설정 값 타입
+// ============================================
 export interface BlogScoreFormula {
   exposure_weight: number
   rank_weight: number
@@ -103,6 +163,9 @@ export interface SlackWebhookConfig {
   description: string
 }
 
+// ============================================
+// 레거시 타입 (마이그레이션용)
+// ============================================
 export interface PublishRecord {
   id: string
   main_keyword: string
