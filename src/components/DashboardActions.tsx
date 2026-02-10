@@ -219,7 +219,7 @@ export default function DashboardActions() {
       )}
 
       {/* 액션 버튼들 */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
         <button
           onClick={runWeeklyRank}
           disabled={loading !== null || serverStatus?.rank_running}
@@ -248,10 +248,19 @@ export default function DashboardActions() {
           className="flex flex-col items-center gap-2 p-4 bg-purple-600/20 border border-purple-500/30 rounded-lg hover:bg-purple-600/30 transition disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <span className="text-2xl">📊</span>
-          <span className="text-purple-300 text-sm font-medium">주간 분석</span>
-          <span className="text-slate-500 text-xs">블로그 지수 계산</span>
+          <span className="text-purple-300 text-sm font-medium">발행 추천 분석</span>
+          <span className="text-slate-500 text-xs">지수 계산 & 추천 생성</span>
           {loading === 'analysis' && <span className="text-xs text-yellow-400">실행 중...</span>}
         </button>
+
+        <a
+          href="/dashboard/recommendations"
+          className="flex flex-col items-center gap-2 p-4 bg-amber-600/20 border border-amber-500/30 rounded-lg hover:bg-amber-600/30 transition"
+        >
+          <span className="text-2xl">💡</span>
+          <span className="text-amber-300 text-sm font-medium">발행 추천 보기</span>
+          <span className="text-slate-500 text-xs">추천 페이지로 이동</span>
+        </a>
 
         <button
           onClick={checkServerStatus}

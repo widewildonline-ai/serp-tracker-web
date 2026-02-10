@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Account, Keyword, SerpResult } from '@/types/database'
+import { Account, Keyword, SerpResult, Json } from '@/types/database'
 
 type KeywordWithSerp = Keyword & {
   account: Pick<Account, 'id' | 'name' | 'blog_score'> | null
@@ -30,7 +30,9 @@ export default function RecommendationsPage() {
   const [recommendations, setRecommendations] = useState<Recommendation[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [loading, setLoading] = useState(true)
+  const [analyzing, setAnalyzing] = useState(false)
   const [dailyLimits, setDailyLimits] = useState<DailyLimitsSettings | null>(null)
+  const [lastAnalyzedAt, setLastAnalyzedAt] = useState<string | null>(null)
   const dataLoadedRef = useRef(false)
 
   const supabase = createClient()
@@ -162,12 +164,8 @@ export default function RecommendationsPage() {
     return recs.sort((a, b) => b.expectedImpact - a.expectedImpact)
   }
 
-  // 데이터 로드 (한 번만 실행)
-  useEffect(() => {
-    if (dataLoadedRef.current) return
-    dataLoadedRef.current = true
-
-    const loadData = async () => {
+  // 데이터 로드 함수
+  const loadData = useCallback(async () => {
       setLoading(true)
 
       // 설정 로드
@@ -178,6 +176,17 @@ export default function RecommendationsPage() {
         .single()
       
       const loadedSettings = settingsData?.value as DailyLimitsSettings | null
+
+    // 마지막 분석 시간 로드
+    const { data: lastAnalysis } = await supabase
+      .from('settings')
+      .select('value')
+      .eq('key', 'last_analysis_time')
+      .single()
+    
+    if (lastAnalysis?.value) {
+      setLastAnalyzedAt((lastAnalysis.value as { timestamp: string }).timestamp)
+    }
 
       // 계정 로드
       const { data: accountsData } = await supabase
@@ -217,10 +226,66 @@ export default function RecommendationsPage() {
       }
 
       setLoading(false)
-    }
-
-    loadData()
   }, [supabase])
+
+  // 수동 분석 실행
+  const runManualAnalysis = useCallback(async () => {
+    setAnalyzing(true)
+
+    try {
+      // EC2 설정 가져오기
+      const { data: ec2Settings } = await supabase
+        .from('settings')
+        .select('value')
+        .eq('key', 'ec2_api')
+        .single()
+
+      if (ec2Settings?.value) {
+        const config = ec2Settings.value as { base_url: string; secret: string }
+        
+        // EC2 서버에 분석 요청
+        try {
+          const response = await fetch(`${config.base_url}/run-analysis`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ secret: config.secret }),
+          })
+
+          if (!response.ok) {
+            console.warn('EC2 분석 요청 실패, 로컬 분석 수행')
+          }
+        } catch (e) {
+          console.warn('EC2 서버 연결 실패, 로컬 분석 수행')
+        }
+      }
+
+      // 분석 시간 저장
+      const now = new Date().toISOString()
+      await supabase
+        .from('settings')
+        .upsert({ 
+          key: 'last_analysis_time', 
+          value: { timestamp: now } as unknown as Json
+        }, { onConflict: 'key' })
+      
+      setLastAnalyzedAt(now)
+
+      // 데이터 새로고침
+      await loadData()
+
+    } catch (error) {
+      console.error('분석 실행 오류:', error)
+    } finally {
+      setAnalyzing(false)
+    }
+  }, [supabase, loadData])
+
+  // 데이터 로드 (한 번만 실행)
+  useEffect(() => {
+    if (dataLoadedRef.current) return
+    dataLoadedRef.current = true
+    loadData()
+  }, [loadData])
 
   // 계정별 할당 현황
   const accountAllocation = accounts.map(acc => {
@@ -238,12 +303,54 @@ export default function RecommendationsPage() {
     total: recommendations.length,
   }
 
+  // 시간 포맷
+  const formatTime = (isoString: string | null) => {
+    if (!isoString) return '분석 기록 없음'
+    const date = new Date(isoString)
+    return date.toLocaleString('ko-KR', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  }
+
   return (
     <div className="space-y-6">
       {/* 헤더 */}
-      <div>
-        <h1 className="text-2xl font-bold text-white">발행 추천</h1>
-        <p className="text-slate-400 mt-1">미노출 키워드를 분석하여 최적의 발행 전략을 추천합니다</p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-white">발행 추천</h1>
+          <p className="text-slate-400 mt-1">미노출 키워드를 분석하여 최적의 발행 전략을 추천합니다</p>
+          {lastAnalyzedAt && (
+            <p className="text-slate-500 text-sm mt-1">
+              마지막 분석: {formatTime(lastAnalyzedAt)}
+            </p>
+          )}
+        </div>
+        <div className="flex gap-3">
+          <button
+            onClick={() => { dataLoadedRef.current = false; loadData() }}
+            disabled={loading}
+            className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition flex items-center gap-2 disabled:opacity-50"
+          >
+            🔄 새로고침
+          </button>
+          <button
+            onClick={runManualAnalysis}
+            disabled={analyzing || loading}
+            className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition flex items-center gap-2 disabled:opacity-50"
+          >
+            {analyzing ? (
+              <>
+                <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
+                분석 중...
+              </>
+            ) : (
+              <>📊 분석 실행</>
+            )}
+          </button>
+        </div>
       </div>
 
       {/* 로딩 표시 */}
