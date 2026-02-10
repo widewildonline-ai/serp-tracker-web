@@ -4,12 +4,10 @@ import { useState, useEffect } from 'react'
 import { createClient } from '@/lib/supabase/client'
 
 interface ServerStatus {
-  rank_running: boolean
-  rank_pid: number | null
-  volume_running: boolean
-  volume_pid: number | null
-  analysis_running: boolean
-  analysis_pid: number | null
+  ok: boolean
+  rank_locked: boolean
+  volume_locked: boolean
+  analysis_locked: boolean
 }
 
 export default function DashboardActions() {
@@ -45,7 +43,7 @@ export default function DashboardActions() {
 
     setLoading('status')
     try {
-      const response = await fetch(`${ec2Config.base_url}/status`, {
+      const response = await fetch(`${ec2Config.base_url}/health`, {
         method: 'GET',
       })
       
@@ -53,7 +51,7 @@ export default function DashboardActions() {
       
       const data = await response.json()
       setServerStatus(data)
-      setMessage({ type: 'success', text: '서버 상태를 확인했습니다' })
+      setMessage({ type: 'success', text: data.ok ? '서버 정상 연결' : '서버 상태 확인 필요' })
     } catch (err) {
       setMessage({ type: 'error', text: '서버 연결 실패' })
       setServerStatus(null)
@@ -186,22 +184,31 @@ export default function DashboardActions() {
       {/* 서버 상태 표시 */}
       {serverStatus && (
         <div className="mb-4 p-4 bg-slate-700/50 rounded-lg">
-          <p className="text-slate-400 text-sm mb-2">서버 상태</p>
+          <div className="flex items-center gap-2 mb-2">
+            <div className={`w-2 h-2 rounded-full ${serverStatus.ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
+            <p className="text-slate-400 text-sm">서버 {serverStatus.ok ? '정상' : '오류'}</p>
+          </div>
           <div className="grid grid-cols-3 gap-4 text-sm">
             <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${serverStatus.rank_running ? 'bg-yellow-500 animate-pulse' : 'bg-slate-500'}`} />
+              <div className={`w-2 h-2 rounded-full ${serverStatus.rank_locked ? 'bg-yellow-500 animate-pulse' : 'bg-emerald-500'}`} />
               <span className="text-slate-300">순위 추적</span>
-              {serverStatus.rank_running && <span className="text-xs text-yellow-400">실행 중</span>}
+              {serverStatus.rank_locked ? 
+                <span className="text-xs text-yellow-400">실행 중</span> : 
+                <span className="text-xs text-emerald-400">대기</span>}
             </div>
             <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${serverStatus.volume_running ? 'bg-yellow-500 animate-pulse' : 'bg-slate-500'}`} />
+              <div className={`w-2 h-2 rounded-full ${serverStatus.volume_locked ? 'bg-yellow-500 animate-pulse' : 'bg-emerald-500'}`} />
               <span className="text-slate-300">검색량</span>
-              {serverStatus.volume_running && <span className="text-xs text-yellow-400">실행 중</span>}
+              {serverStatus.volume_locked ? 
+                <span className="text-xs text-yellow-400">실행 중</span> : 
+                <span className="text-xs text-emerald-400">대기</span>}
             </div>
             <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${serverStatus.analysis_running ? 'bg-yellow-500 animate-pulse' : 'bg-slate-500'}`} />
+              <div className={`w-2 h-2 rounded-full ${serverStatus.analysis_locked ? 'bg-yellow-500 animate-pulse' : 'bg-emerald-500'}`} />
               <span className="text-slate-300">분석</span>
-              {serverStatus.analysis_running && <span className="text-xs text-yellow-400">실행 중</span>}
+              {serverStatus.analysis_locked ? 
+                <span className="text-xs text-yellow-400">실행 중</span> : 
+                <span className="text-xs text-emerald-400">대기</span>}
             </div>
           </div>
         </div>
@@ -222,7 +229,7 @@ export default function DashboardActions() {
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
         <button
           onClick={runWeeklyRank}
-          disabled={loading !== null || serverStatus?.rank_running}
+          disabled={loading !== null || serverStatus?.rank_locked}
           className="flex flex-col items-center gap-2 p-4 bg-blue-600/20 border border-blue-500/30 rounded-lg hover:bg-blue-600/30 transition disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <span className="text-2xl">🔄</span>
@@ -233,7 +240,7 @@ export default function DashboardActions() {
 
         <button
           onClick={runVolumeUpdate}
-          disabled={loading !== null || serverStatus?.volume_running}
+          disabled={loading !== null || serverStatus?.volume_locked}
           className="flex flex-col items-center gap-2 p-4 bg-green-600/20 border border-green-500/30 rounded-lg hover:bg-green-600/30 transition disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <span className="text-2xl">📈</span>
@@ -244,7 +251,7 @@ export default function DashboardActions() {
 
         <button
           onClick={runWeeklyAnalysis}
-          disabled={loading !== null || serverStatus?.analysis_running}
+          disabled={loading !== null || serverStatus?.analysis_locked}
           className="flex flex-col items-center gap-2 p-4 bg-purple-600/20 border border-purple-500/30 rounded-lg hover:bg-purple-600/30 transition disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <span className="text-2xl">📊</span>
