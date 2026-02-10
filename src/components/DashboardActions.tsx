@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { createClient } from '@/lib/supabase/client'
 
 interface ServerStatus {
   ok: boolean
@@ -14,36 +13,18 @@ export default function DashboardActions() {
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null)
   const [loading, setLoading] = useState<string | null>(null)
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
-  const [ec2Config, setEc2Config] = useState<{ base_url: string; secret: string } | null>(null)
+  const [ready, setReady] = useState(false)
 
-  const supabase = createClient()
-
-  // EC2 설정 로드
+  // 컴포넌트 준비 상태
   useEffect(() => {
-    const loadConfig = async () => {
-      const { data } = await supabase
-        .from('settings')
-        .select('value')
-        .eq('key', 'ec2_api')
-        .single()
-      
-      if (data?.value) {
-        setEc2Config(data.value as { base_url: string; secret: string })
-      }
-    }
-    loadConfig()
-  }, [supabase])
+    setReady(true)
+  }, [])
 
-  // 서버 상태 확인
+  // 서버 상태 확인 (프록시 API 사용)
   const checkServerStatus = async () => {
-    if (!ec2Config) {
-      setMessage({ type: 'error', text: 'EC2 API 설정이 없습니다' })
-      return
-    }
-
     setLoading('status')
     try {
-      const response = await fetch(`${ec2Config.base_url}/health`, {
+      const response = await fetch('/api/ec2/health', {
         method: 'GET',
       })
       
@@ -62,19 +43,14 @@ export default function DashboardActions() {
 
   // 주간 분석 실행 (블로그 지수 계산)
   const runWeeklyAnalysis = async () => {
-    if (!ec2Config) {
-      setMessage({ type: 'error', text: 'EC2 API 설정이 없습니다' })
-      return
-    }
-
     if (!confirm('주간 분석을 실행합니다.\n\n• 블로그 지수 계산\n• 노출잠재력 평가\n• 발행 추천 생성\n\n계속하시겠습니까?')) return
 
     setLoading('analysis')
     try {
-      const response = await fetch(`${ec2Config.base_url}/run-analysis`, {
+      const response = await fetch('/api/ec2/run-analysis', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ secret: ec2Config.secret })
+        body: JSON.stringify({})
       })
       
       if (!response.ok) throw new Error('서버 응답 오류')
@@ -96,19 +72,14 @@ export default function DashboardActions() {
 
   // 주간 순위 추적
   const runWeeklyRank = async () => {
-    if (!ec2Config) {
-      setMessage({ type: 'error', text: 'EC2 API 설정이 없습니다' })
-      return
-    }
-
     if (!confirm('주간 전체 최신화를 실행합니다.\n모든 키워드의 순위를 새로 수집합니다.\n\n계속하시겠습니까?')) return
 
     setLoading('rank')
     try {
-      const response = await fetch(`${ec2Config.base_url}/run`, {
+      const response = await fetch('/api/ec2/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ secret: ec2Config.secret, mode: 'weekly' })
+        body: JSON.stringify({ mode: 'weekly' })
       })
       
       if (!response.ok) throw new Error('서버 응답 오류')
@@ -129,19 +100,14 @@ export default function DashboardActions() {
 
   // 검색량 최신화
   const runVolumeUpdate = async () => {
-    if (!ec2Config) {
-      setMessage({ type: 'error', text: 'EC2 API 설정이 없습니다' })
-      return
-    }
-
     if (!confirm('검색량 최신화를 실행합니다.\n모든 키워드의 월간 검색량을 업데이트합니다.\n\n계속하시겠습니까?')) return
 
     setLoading('volume')
     try {
-      const response = await fetch(`${ec2Config.base_url}/run-volume`, {
+      const response = await fetch('/api/ec2/run-volume', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ secret: ec2Config.secret })
+        body: JSON.stringify({})
       })
       
       if (!response.ok) throw new Error('서버 응답 오류')
