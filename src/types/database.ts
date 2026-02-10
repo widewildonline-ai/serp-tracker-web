@@ -1,5 +1,14 @@
 // Supabase 테이블 타입 정의
 
+// JSON 타입 (Supabase jsonb 컬럼용)
+export type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: Json | undefined }
+  | Json[]
+
 export interface Account {
   id: string
   name: string
